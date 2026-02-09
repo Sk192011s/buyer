@@ -7,6 +7,9 @@ const webPassword = Deno.env.get('WEB_PASSWORD') || '';
 const wsPath = Deno.env.get('WS_PATH') || '/ws';
 const webUsername = Deno.env.get('WEB_USERNAME') || 'admin';
 
+// 🔧 FIXED: Sticky Proxy IP — env variable ကနေ force-fix လုပ်လို့ရတယ်
+const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '';
+
 const CONFIG_FILE = 'config.json';
 
 interface Config {
@@ -16,7 +19,6 @@ interface Config {
 // --- Rate Limiting ---
 const loginAttempts = new Map<string, { count: number; lastAttempt: number }>();
 
-// Rate limit map cleanup — 30 မိနစ်တိုင်း old entries ရှင်းပေး
 setInterval(() => {
   const now = Date.now();
   for (const [ip, record] of loginAttempts) {
@@ -42,16 +44,28 @@ function isRateLimited(ip: string): boolean {
   return record.count > 5;
 }
 
-// --- UUID Masking for Logs ---
 function maskUUID(uuid: string): string {
   if (uuid.length < 8) return '****';
   return uuid.slice(0, 4) + '****-****-****-****-********' + uuid.slice(-4);
 }
 
-// --- ProxyIP Random Selection ---
-function getRandomProxyIP(): string {
-  if (proxyIPs.length === 0) return '';
-  return proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+// 🔧 FIXED: Proxy IP ကို ပုံသေထားတဲ့ logic
+// Server start တဲ့အချိန်မှာ IP တစ်ခုကို select လုပ်ပြီး ဒီ IP ကိုပဲ အမြဲသုံးမယ်
+let fixedProxyIP: string = '';
+
+if (stickyProxyIPEnv) {
+  // STICKY_PROXYIP env variable ရှိရင် ဒါကိုပဲ force-use မယ်
+  fixedProxyIP = stickyProxyIPEnv.trim();
+  console.log(`Using STICKY_PROXYIP (forced): ${fixedProxyIP}`);
+} else if (proxyIPs.length > 0) {
+  // PROXYIP list ထဲက တစ်ခုကို server start မှာ ရွေးပြီး fix ထားမယ်
+  fixedProxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+  console.log(`Selected fixed Proxy IP from list: ${fixedProxyIP} (will not change until restart)`);
+}
+
+// 🔧 FIXED: ဒီ function က အမြဲ fixed IP ကိုပဲ return ပြန်မယ်
+function getFixedProxyIP(): string {
+  return fixedProxyIP;
 }
 
 // --- UUID Management ---
@@ -81,7 +95,6 @@ async function saveUUIDToConfig(uuid: string): Promise<void> {
   }
 }
 
-// --- Multiple UUID Support ---
 let userIDs: string[] = [];
 
 if (envUUID) {
@@ -112,11 +125,10 @@ const primaryUserID = userIDs[0];
 console.log(Deno.version);
 console.log(`UUIDs in use: ${userIDs.map(maskUUID).join(', ')}`);
 console.log(`WebSocket path: ${wsPath}`);
+console.log(`Fixed Proxy IP: ${fixedProxyIP || '(none — direct connection)'}`); // 🔧 FIXED: log ထဲမှာ ပြ
 
-// --- Connection Timeout ---
-const CONNECTION_TIMEOUT = 10000; // 10 seconds
+const CONNECTION_TIMEOUT = 10000;
 
-// --- STYLISH UI CSS & HTML HELPER ---
 const getHtml = (title: string, bodyContent: string) => `
 <!DOCTYPE html>
 <html lang="en">
@@ -318,7 +330,6 @@ const getHtml = (title: string, bodyContent: string) => `
 </html>
 `;
 
-// --- Connection with Timeout ---
 async function connectWithTimeout(hostname: string, port: number, timeout: number): Promise<Deno.TcpConn> {
   const conn = Deno.connect({ hostname, port });
   const timer = new Promise<never>((_, reject) => {
@@ -330,7 +341,6 @@ async function connectWithTimeout(hostname: string, port: number, timeout: numbe
 Deno.serve(async (request: Request) => {
   const upgrade = request.headers.get('upgrade') || '';
 
-  // WebSocket handling — Custom path check
   if (upgrade.toLowerCase() == 'websocket') {
     const url = new URL(request.url);
     if (url.pathname !== wsPath) {
@@ -339,16 +349,15 @@ Deno.serve(async (request: Request) => {
     return await vlessOverWSHandler(request);
   }
 
-  // --- HTTP Handling (Web UI) ---
   const url = new URL(request.url);
 
-  // Health check endpoint
   if (url.pathname === '/health') {
     const healthInfo = {
       status: 'ok',
       timestamp: new Date().toISOString(),
       uuidCount: userIDs.length,
       proxyIPCount: proxyIPs.length,
+      fixedProxyIP: fixedProxyIP || '(none)', // 🔧 FIXED: health check မှာ fixed IP ပြ
       wsPath: wsPath,
     };
     return new Response(JSON.stringify(healthInfo, null, 2), {
@@ -357,7 +366,6 @@ Deno.serve(async (request: Request) => {
     });
   }
 
-  // Subscription endpoint — password protected separately
   if (url.pathname === '/sub') {
     if (webPassword) {
       const authHeader = request.headers.get("Authorization");
@@ -390,7 +398,6 @@ Deno.serve(async (request: Request) => {
     });
   }
 
-  // Password Protection with Rate Limiting
   if (webPassword) {
     const clientIP = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
                      request.headers.get('cf-connecting-ip') || 'unknown';
@@ -416,7 +423,6 @@ Deno.serve(async (request: Request) => {
     }
   }
 
-  // Route Handling
   switch (url.pathname) {
     case '/': {
       const content = `
@@ -587,14 +593,12 @@ async function vlessOverWSHandler(request: Request) {
         },
         close() {
           log(`readableWebSocketStream is close`);
-          // TCP socket cleanup
           if (remoteSocketWapper.value) {
             try { remoteSocketWapper.value.close(); } catch (_) { /* already closed */ }
           }
         },
         abort(reason) {
           log(`readableWebSocketStream is abort`, JSON.stringify(reason));
-          // TCP socket cleanup
           if (remoteSocketWapper.value) {
             try { remoteSocketWapper.value.close(); } catch (_) { /* already closed */ }
           }
@@ -603,7 +607,6 @@ async function vlessOverWSHandler(request: Request) {
     )
     .catch((err) => {
       log('readableWebSocketStream pipeTo error', err);
-      // Ensure cleanup on error
       if (remoteSocketWapper.value) {
         try { remoteSocketWapper.value.close(); } catch (_) { /* already closed */ }
       }
@@ -613,6 +616,7 @@ async function vlessOverWSHandler(request: Request) {
   return response;
 }
 
+// 🔧 FIXED: handleTCPOutBound — retry မှာ fixed IP သုံးအောင်ပြင်ထားတယ်
 async function handleTCPOutBound(
   remoteSocket: { value: Deno.TcpConn | null },
   addressRemote: string,
@@ -639,12 +643,14 @@ async function handleTCPOutBound(
 
   async function retry() {
     try {
-      const fallbackIP = getRandomProxyIP();
+      // 🔧 FIXED: getRandomProxyIP() အစား getFixedProxyIP() သုံး
+      const fallbackIP = getFixedProxyIP();
       if (!fallbackIP) {
         log('No proxy IP available for retry');
         safeCloseWebSocket(webSocket);
         return;
       }
+      log(`Retrying with fixed proxy IP: ${fallbackIP}`);
       const tcpSocket = await connectAndWrite(fallbackIP, portRemote);
       remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
     } catch (e) {
@@ -733,7 +739,6 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
   const command = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
 
   if (command === 1) {
-    // TCP
   } else if (command === 2) {
     isUDP = true;
   } else {
