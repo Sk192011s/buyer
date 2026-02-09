@@ -7,8 +7,8 @@ const webPassword = Deno.env.get('WEB_PASSWORD') || '';
 const wsPath = Deno.env.get('WS_PATH') || '/ws';
 const webUsername = Deno.env.get('WEB_USERNAME') || 'admin';
 
-// 🔧 FIXED: Sticky Proxy IP — env variable ကနေ force-fix လုပ်လို့ရတယ်
-const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '34.142.215.5';
+// 🔧 STICKY_PROXYIP env variable ကနေ force-fix လုပ်လို့ရတယ်
+const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '';
 
 const CONFIG_FILE = 'config.json';
 
@@ -49,21 +49,17 @@ function maskUUID(uuid: string): string {
   return uuid.slice(0, 4) + '****-****-****-****-********' + uuid.slice(-4);
 }
 
-// 🔧 FIXED: Proxy IP ကို ပုံသေထားတဲ့ logic
-// Server start တဲ့အချိန်မှာ IP တစ်ခုကို select လုပ်ပြီး ဒီ IP ကိုပဲ အမြဲသုံးမယ်
+// 🔧 Proxy IP ကို ပုံသေထားတဲ့ logic
 let fixedProxyIP: string = '';
 
 if (stickyProxyIPEnv) {
-  // STICKY_PROXYIP env variable ရှိရင် ဒါကိုပဲ force-use မယ်
   fixedProxyIP = stickyProxyIPEnv.trim();
   console.log(`Using STICKY_PROXYIP (forced): ${fixedProxyIP}`);
 } else if (proxyIPs.length > 0) {
-  // PROXYIP list ထဲက တစ်ခုကို server start မှာ ရွေးပြီး fix ထားမယ်
   fixedProxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
   console.log(`Selected fixed Proxy IP from list: ${fixedProxyIP} (will not change until restart)`);
 }
 
-// 🔧 FIXED: ဒီ function က အမြဲ fixed IP ကိုပဲ return ပြန်မယ်
 function getFixedProxyIP(): string {
   return fixedProxyIP;
 }
@@ -125,7 +121,7 @@ const primaryUserID = userIDs[0];
 console.log(Deno.version);
 console.log(`UUIDs in use: ${userIDs.map(maskUUID).join(', ')}`);
 console.log(`WebSocket path: ${wsPath}`);
-console.log(`Fixed Proxy IP: ${fixedProxyIP || '(none — direct connection)'}`); // 🔧 FIXED: log ထဲမှာ ပြ
+console.log(`Fixed Proxy IP: ${fixedProxyIP || '(none — direct connection)'}`);
 
 const CONNECTION_TIMEOUT = 10000;
 
@@ -357,7 +353,7 @@ Deno.serve(async (request: Request) => {
       timestamp: new Date().toISOString(),
       uuidCount: userIDs.length,
       proxyIPCount: proxyIPs.length,
-      fixedProxyIP: fixedProxyIP || '(none)', // 🔧 FIXED: health check မှာ fixed IP ပြ
+      fixedProxyIP: fixedProxyIP || '(none)',
       wsPath: wsPath,
     };
     return new Response(JSON.stringify(healthInfo, null, 2), {
@@ -616,7 +612,7 @@ async function vlessOverWSHandler(request: Request) {
   return response;
 }
 
-// 🔧 FIXED: handleTCPOutBound — retry မှာ fixed IP သုံးအောင်ပြင်ထားတယ်
+// ✅ FIXED: ပထမ connection ကိုပဲ proxy IP ကနေ သွားအောင် ပြင်ထားတယ်
 async function handleTCPOutBound(
   remoteSocket: { value: Deno.TcpConn | null },
   addressRemote: string,
@@ -641,17 +637,25 @@ async function handleTCPOutBound(
     }
   }
 
+  // ✅ Proxy IP ရှိရင် proxy ကနေ အရင်သွား၊ မရှိရင် တိုက်ရိုက်
+  const proxyIP = getFixedProxyIP();
+  const targetAddress = proxyIP || addressRemote;
+
+  if (proxyIP) {
+    log(`Using proxy IP: ${proxyIP} for ${addressRemote}:${portRemote}`);
+  }
+
   async function retry() {
     try {
-      // 🔧 FIXED: getRandomProxyIP() အစား getFixedProxyIP() သုံး
-      const fallbackIP = getFixedProxyIP();
-      if (!fallbackIP) {
-        log('No proxy IP available for retry');
+      // ✅ retry မှာ proxy သုံးခဲ့ရင် direct ကို ကြိုးစား၊ direct သုံးခဲ့ရင် proxy ကို ကြိုးစား
+      const fallbackAddress = proxyIP ? addressRemote : '';
+      if (!fallbackAddress) {
+        log('No fallback address available for retry');
         safeCloseWebSocket(webSocket);
         return;
       }
-      log(`Retrying with fixed proxy IP: ${fallbackIP}`);
-      const tcpSocket = await connectAndWrite(fallbackIP, portRemote);
+      log(`Retrying with fallback: ${fallbackAddress}`);
+      const tcpSocket = await connectAndWrite(fallbackAddress, portRemote);
       remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
     } catch (e) {
       log(`Retry failed: ${(e as Error).message}`);
@@ -660,7 +664,8 @@ async function handleTCPOutBound(
   }
 
   try {
-    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+    // ✅ ပထမ connection — proxy IP ရှိရင် proxy ကနေ သွား
+    const tcpSocket = await connectAndWrite(targetAddress, portRemote);
     remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
   } catch (e) {
     log(`Initial connection failed: ${(e as Error).message}, attempting retry...`);
@@ -837,7 +842,7 @@ async function remoteSocketToWS(remoteSocket: Deno.TcpConn, webSocket: WebSocket
 
   if (hasIncomingData === false && retry) {
     log(`retry`);
-    retry();
+    await retry();
   }
 }
 
