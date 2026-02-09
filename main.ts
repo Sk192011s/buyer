@@ -1,9 +1,11 @@
 import { exists } from "https://deno.land/std/fs/exists.ts";
 
 const envUUID = Deno.env.get('UUID') || '';
-const proxyIP = Deno.env.get('PROXYIP') || '';
+const proxyIPs = (Deno.env.get('PROXYIP') || '').split(',').map(ip => ip.trim()).filter(Boolean);
 const credit = Deno.env.get('CREDIT') || '';
-const webPassword = Deno.env.get('WEB_PASSWORD') || ''; // Password for Web UI
+const webPassword = Deno.env.get('WEB_PASSWORD') || '';
+const wsPath = Deno.env.get('WS_PATH') || '/ws';
+const webUsername = Deno.env.get('WEB_USERNAME') || 'admin';
 
 const CONFIG_FILE = 'config.json';
 
@@ -11,6 +13,32 @@ interface Config {
   uuid?: string;
 }
 
+// --- Rate Limiting ---
+const loginAttempts = new Map<string, { count: number; lastAttempt: number }>();
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const record = loginAttempts.get(ip);
+  if (!record) {
+    loginAttempts.set(ip, { count: 1, lastAttempt: now });
+    return false;
+  }
+  if (now - record.lastAttempt > 15 * 60 * 1000) {
+    loginAttempts.set(ip, { count: 1, lastAttempt: now });
+    return false;
+  }
+  record.count++;
+  record.lastAttempt = now;
+  return record.count > 5;
+}
+
+// --- ProxyIP Random Selection ---
+function getRandomProxyIP(): string {
+  if (proxyIPs.length === 0) return '';
+  return proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+}
+
+// --- UUID Management ---
 async function getUUIDFromConfig(): Promise<string | undefined> {
   if (await exists(CONFIG_FILE)) {
     try {
@@ -37,28 +65,37 @@ async function saveUUIDToConfig(uuid: string): Promise<void> {
   }
 }
 
-let userID: string;
+// --- Multiple UUID Support ---
+let userIDs: string[] = [];
 
-if (envUUID && isValidUUID(envUUID)) {
-  userID = envUUID;
-  console.log(`Using UUID from environment: ${userID}`);
-} else {
-  const configUUID = await getUUIDFromConfig();
-  if (configUUID) {
-    userID = configUUID;
-  } else {
-    userID = crypto.randomUUID();
-    console.log(`Generated new UUID: ${userID}`);
-    await saveUUIDToConfig(userID);
+if (envUUID) {
+  userIDs = envUUID.split(',').map(u => u.trim()).filter(isValidUUID);
+  if (userIDs.length > 0) {
+    console.log(`Using UUIDs from environment: ${userIDs.join(', ')}`);
   }
 }
 
-if (!isValidUUID(userID)) {
-  throw new Error('uuid is not valid');
+if (userIDs.length === 0) {
+  const configUUID = await getUUIDFromConfig();
+  if (configUUID) {
+    userIDs.push(configUUID);
+  } else {
+    const newUUID = crypto.randomUUID();
+    console.log(`Generated new UUID: ${newUUID}`);
+    await saveUUIDToConfig(newUUID);
+    userIDs.push(newUUID);
+  }
 }
 
+if (userIDs.length === 0) {
+  throw new Error('No valid UUID available');
+}
+
+const primaryUserID = userIDs[0];
+
 console.log(Deno.version);
-console.log(`Final UUID in use: ${userID}`);
+console.log(`UUIDs in use: ${userIDs.join(', ')}`);
+console.log(`WebSocket path: ${wsPath}`);
 
 // --- STYLISH UI CSS & HTML HELPER ---
 const getHtml = (title: string, bodyContent: string) => `
@@ -135,6 +172,7 @@ const getHtml = (title: string, bodyContent: string) => `
             border: none;
             cursor: pointer;
             font-size: 1rem;
+            margin: 5px;
         }
         .btn:hover {
             background: var(--primary-hover);
@@ -197,6 +235,21 @@ const getHtml = (title: string, bodyContent: string) => `
         .copy-btn:hover {
             background: rgba(59, 130, 246, 0.2);
         }
+        .user-section {
+            border-top: 1px solid var(--border);
+            margin-top: 30px;
+            padding-top: 20px;
+        }
+        .user-label {
+            display: inline-block;
+            background: rgba(59, 130, 246, 0.1);
+            color: #60a5fa;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
         .footer {
             margin-top: 40px;
             font-size: 0.85rem;
@@ -244,21 +297,67 @@ const getHtml = (title: string, bodyContent: string) => `
 
 Deno.serve(async (request: Request) => {
   const upgrade = request.headers.get('upgrade') || '';
-  
-  // WebSocket handling (VLESS Core) - No auth needed here for clients
+
+  // WebSocket handling — Custom path check
   if (upgrade.toLowerCase() == 'websocket') {
+    const url = new URL(request.url);
+    if (url.pathname !== wsPath) {
+      return new Response('Not Found', { status: 404 });
+    }
     return await vlessOverWSHandler(request);
   }
 
   // --- HTTP Handling (Web UI) ---
   const url = new URL(request.url);
 
-  // 1. Password Protection Logic (Basic Auth)
+  // Subscription endpoint — password protected separately
+  if (url.pathname === '/sub') {
+    if (webPassword) {
+      const authHeader = request.headers.get("Authorization");
+      const expectedAuth = `Basic ${btoa(`${webUsername}:${webPassword}`)}`;
+      if (authHeader !== expectedAuth) {
+        return new Response("Unauthorized", {
+          status: 401,
+          headers: {
+            "WWW-Authenticate": 'Basic realm="VLESS Proxy Admin"',
+            "Content-Type": "text/plain"
+          },
+        });
+      }
+    }
+
+    const hostName = url.hostname;
+    const port = url.port || (url.protocol === 'https:' ? 443 : 80);
+    const allLinks = userIDs.map((uid, index) => {
+      const tag = credit ? `${credit}-${index + 1}` : `${hostName}-${index + 1}`;
+      return `vless://${uid}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=${encodeURIComponent(wsPath + '?ed=2048')}#${tag}`;
+    }).join('\n');
+
+    const base64Content = btoa(allLinks);
+    return new Response(base64Content, {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Profile-Update-Interval': '12',
+        'Subscription-Userinfo': 'upload=0; download=0; total=10737418240; expire=0'
+      },
+    });
+  }
+
+  // Password Protection with Rate Limiting
   if (webPassword) {
+    const clientIP = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+                     request.headers.get('cf-connecting-ip') || 'unknown';
+
+    if (isRateLimited(clientIP)) {
+      return new Response("Too Many Requests. Try again later.", {
+        status: 429,
+        headers: { "Content-Type": "text/plain" },
+      });
+    }
+
     const authHeader = request.headers.get("Authorization");
-    // Expecting "Basic base64(admin:yourpassword)"
-    const expectedAuth = `Basic ${btoa(`admin:${webPassword}`)}`;
-    
+    const expectedAuth = `Basic ${btoa(`${webUsername}:${webPassword}`)}`;
+
     if (authHeader !== expectedAuth) {
       return new Response("Unauthorized Access", {
         status: 401,
@@ -270,119 +369,130 @@ Deno.serve(async (request: Request) => {
     }
   }
 
-  // 2. Route Handling
+  // Route Handling
   switch (url.pathname) {
     case '/': {
       const content = `
           <h1>⚡ Deno VLESS Proxy</h1>
           <p>Your secure VLESS WebSocket proxy server is active and running efficiently.</p>
           <div style="margin-top: 30px;">
-              <a href="/${userID}" class="btn">Get Configuration</a>
+              <a href="/config" class="btn">Get Configuration</a>
+              <a href="/sub" class="btn" style="background: #7c3aed;">Subscription Link</a>
           </div>
           <div class="footer">
-              Powered by Deno Deploy • <a href="https://t.me/iqowoq" target="_blank">Support</a>
+              Powered by Deno Deploy
           </div>
       `;
       return new Response(getHtml('Deno Proxy Status', content), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
-    
-    case `/${userID}`: {
+
+    case '/config': {
       const hostName = url.hostname;
       const port = url.port || (url.protocol === 'https:' ? 443 : 80);
-      const vlessMain = `vless://${userID}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${credit}`;      
-      
-      // Ping Check Logic
-      const ck = `vless://${userID}\u0040${hostName}:443?encryption=none%26security=tls%26sni=${hostName}%26fp=randomized%26type=ws%26host=${hostName}%26path=%2F%3Fed%3D2048%23${credit}`;
-      const urlString = `https://deno-proxy-version.deno.dev/?check=${ck}`;
-      // Background fetch, don't await blocking response
-      fetch(urlString).catch(e => console.log("Check pixel error", e));
 
-      const clashMetaConfig = `
+      let userSections = '';
+      userIDs.forEach((uid, index) => {
+        const tag = credit ? `${credit}-${index + 1}` : `${hostName}-${index + 1}`;
+        const vlessLink = `vless://${uid}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=${encodeURIComponent(wsPath + '?ed=2048')}#${tag}`;
+
+        const clashConfig = `
 - type: vless
-  name: ${hostName}
+  name: ${tag}
   server: ${hostName}
   port: ${port}
-  uuid: ${userID}
+  uuid: ${uid}
   network: ws
   tls: true
   udp: false
   sni: ${hostName}
   client-fingerprint: chrome
   ws-opts:
-    path: "/?ed=2048"
+    path: "${wsPath}?ed=2048"
     headers:
-      host: ${hostName}
-`;
+      host: ${hostName}`;
+
+        userSections += `
+          <div class="${index > 0 ? 'user-section' : ''}">
+              <span class="user-label">User ${index + 1}</span>
+              <div class="config-box">
+                  <div class="config-header">
+                      <span class="config-title">VLESS URI (V2RayNG / v2rayN)</span>
+                      <button class="copy-btn" onclick="copyToClipboard('vless-uri-${index}', this)">Copy</button>
+                  </div>
+                  <pre id="vless-uri-${index}">${vlessLink}</pre>
+              </div>
+              <div class="config-box">
+                  <div class="config-header">
+                      <span class="config-title">Clash Meta YAML</span>
+                      <button class="copy-btn" onclick="copyToClipboard('clash-config-${index}', this)">Copy</button>
+                  </div>
+                  <pre id="clash-config-${index}">${clashConfig.trim()}</pre>
+              </div>
+          </div>
+        `;
+      });
 
       const content = `
           <h1>🚀 Server Configuration</h1>
           <p>Import these settings into your V2Ray or Clash client.</p>
-
-          <div class="config-box">
+          ${userSections}
+          <div class="config-box" style="margin-top: 30px;">
               <div class="config-header">
-                  <span class="config-title">VLESS URI (V2RayNG / v2rayN)</span>
-                  <button class="copy-btn" onclick="copyToClipboard('vless-uri', this)">Copy</button>
+                  <span class="config-title">Subscription URL</span>
+                  <button class="copy-btn" onclick="copyToClipboard('sub-url', this)">Copy</button>
               </div>
-              <pre id="vless-uri">${vlessMain}</pre>
+              <pre id="sub-url">https://${hostName}/sub</pre>
           </div>
-
-          <div class="config-box">
-              <div class="config-header">
-                  <span class="config-title">Clash Meta YAML</span>
-                  <button class="copy-btn" onclick="copyToClipboard('clash-config', this)">Copy</button>
-              </div>
-              <pre id="clash-config">${clashMetaConfig.trim()}</pre>
-          </div>
-
           <div class="footer">
               <a href="/">Back to Home</a>
           </div>
       `;
-      
+
       return new Response(getHtml('VLESS Config', content), {
         status: 200,
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      })
+      });
     }
-    default:
-      return new Response(getHtml('404', '<h1>404 Not Found</h1><p>The path you requested does not exist.</p><a href="/" class="btn">Go Home</a>'), { 
-          status: 404, 
-          headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      })
-  }
-})
 
-// --- CORE VLESS LOGIC BELOW (UNCHANGED) ---
+    default:
+      return new Response(getHtml('404', '<h1>404 Not Found</h1><p>The path you requested does not exist.</p><a href="/" class="btn">Go Home</a>'), {
+        status: 404,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+      });
+  }
+});
+
+// --- CORE VLESS LOGIC ---
 
 async function vlessOverWSHandler(request: Request) {
-  const { socket, response } = Deno.upgradeWebSocket(request)
-  let address = ''
-  let portWithRandomLog = ''
+  const { socket, response } = Deno.upgradeWebSocket(request);
+  let address = '';
+  let portWithRandomLog = '';
   const log = (info: string, event = '') => {
-    console.log(`[${address}:${portWithRandomLog}] ${info}`, event)
-  }
-  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || ''
-  const readableWebSocketStream = makeReadableWebSocketStream(socket, earlyDataHeader, log)
+    console.log(`[${address}:${portWithRandomLog}] ${info}`, event);
+  };
+  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+  const readableWebSocketStream = makeReadableWebSocketStream(socket, earlyDataHeader, log);
   let remoteSocketWapper: any = {
     value: null,
-  }
-  let udpStreamWrite: any = null
-  let isDns = false
+  };
+  let udpStreamWrite: any = null;
+  let isDns = false;
 
   readableWebSocketStream
     .pipeTo(
       new WritableStream({
         async write(chunk, controller) {
           if (isDns && udpStreamWrite) {
-            return udpStreamWrite(chunk)
+            return udpStreamWrite(chunk);
           }
           if (remoteSocketWapper.value) {
-            const writer = remoteSocketWapper.value.writable.getWriter()
-            await writer.write(new Uint8Array(chunk))
-            writer.releaseLock()
-            return
+            const writer = remoteSocketWapper.value.writable.getWriter();
+            await writer.write(new Uint8Array(chunk));
+            writer.releaseLock();
+            return;
           }
 
           const {
@@ -393,31 +503,31 @@ async function vlessOverWSHandler(request: Request) {
             rawDataIndex,
             vlessVersion = new Uint8Array([0, 0]),
             isUDP,
-          } = processVlessHeader(chunk, userID) 
-          address = addressRemote
-          portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '} `
+          } = processVlessHeader(chunk, userIDs);
+          address = addressRemote;
+          portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '} `;
           if (hasError) {
-            throw new Error(message) 
-            return
+            throw new Error(message);
+            return;
           }
           if (isUDP) {
             if (portRemote === 53) {
-              isDns = true
+              isDns = true;
             } else {
-              throw new Error('UDP proxy only enable for DNS which is port 53') 
-              return
+              throw new Error('UDP proxy only enable for DNS which is port 53');
+              return;
             }
           }
-          
-          const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0])
-          const rawClientData = chunk.slice(rawDataIndex)
+
+          const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
+          const rawClientData = chunk.slice(rawDataIndex);
 
           if (isDns) {
-            console.log('isDns:', isDns)
-            const { write } = await handleUDPOutBound(socket, vlessResponseHeader, log)
-            udpStreamWrite = write
-            udpStreamWrite(rawClientData)
-            return
+            console.log('isDns:', isDns);
+            const { write } = await handleUDPOutBound(socket, vlessResponseHeader, log);
+            udpStreamWrite = write;
+            udpStreamWrite(rawClientData);
+            return;
           }
           handleTCPOutBound(
             remoteSocketWapper,
@@ -427,21 +537,21 @@ async function vlessOverWSHandler(request: Request) {
             socket,
             vlessResponseHeader,
             log
-          )
+          );
         },
         close() {
-          log(`readableWebSocketStream is close`)
+          log(`readableWebSocketStream is close`);
         },
         abort(reason) {
-          log(`readableWebSocketStream is abort`, JSON.stringify(reason))
+          log(`readableWebSocketStream is abort`, JSON.stringify(reason));
         },
       })
     )
     .catch((err) => {
-      log('readableWebSocketStream pipeTo error', err)
-    })
+      log('readableWebSocketStream pipeTo error', err);
+    });
 
-  return response
+  return response;
 }
 
 async function handleTCPOutBound(
@@ -462,13 +572,18 @@ async function handleTCPOutBound(
     remoteSocket.value = tcpSocket;
     log(`connected to ${address}:${port}`);
     const writer = tcpSocket.writable.getWriter();
-    await writer.write(new Uint8Array(rawClientData)); 
+    await writer.write(new Uint8Array(rawClientData));
     writer.releaseLock();
     return tcpSocket;
   }
 
   async function retry() {
-    const tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote);
+    const fallbackIP = getRandomProxyIP();
+    if (!fallbackIP) {
+      log('No proxy IP available for retry');
+      return;
+    }
+    const tcpSocket = await connectAndWrite(fallbackIP, portRemote);
     remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
   }
 
@@ -519,7 +634,7 @@ function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader
   return stream;
 }
 
-function processVlessHeader(vlessBuffer: ArrayBuffer, userID: string) {
+function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
   if (vlessBuffer.byteLength < 24) {
     return {
       hasError: true,
@@ -529,9 +644,12 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, userID: string) {
   const version = new Uint8Array(vlessBuffer.slice(0, 1));
   let isValidUser = false;
   let isUDP = false;
-  if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === userID) {
+
+  const incomingUUID = stringify(new Uint8Array(vlessBuffer.slice(1, 17)));
+  if (validUserIDs.includes(incomingUUID)) {
     isValidUser = true;
   }
+
   if (!isValidUser) {
     return {
       hasError: true,
@@ -585,7 +703,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, userID: string) {
     default:
       return {
         hasError: true,
-        message: `invild  addressType is ${addressType}`,
+        message: `invild addressType is ${addressType}`,
       };
   }
   if (!addressValue) {
@@ -618,9 +736,9 @@ async function remoteSocketToWS(remoteSocket: Deno.TcpConn, webSocket: WebSocket
             controller.error('webSocket.readyState is not open, maybe close');
           }
 
-          if (vlessResponseHeader) { 
+          if (vlessResponseHeader) {
             webSocket.send(new Uint8Array([...vlessResponseHeader, ...chunk]));
-            vlessResponseHeader = null; 
+            vlessResponseHeader = null;
           } else {
             webSocket.send(chunk);
           }
