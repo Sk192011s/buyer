@@ -16,6 +16,16 @@ interface Config {
 // --- Rate Limiting ---
 const loginAttempts = new Map<string, { count: number; lastAttempt: number }>();
 
+// Rate limit map cleanup — 30 မိနစ်တိုင်း old entries ရှင်းပေး
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of loginAttempts) {
+    if (now - record.lastAttempt > 15 * 60 * 1000) {
+      loginAttempts.delete(ip);
+    }
+  }
+}, 30 * 60 * 1000);
+
 function isRateLimited(ip: string): boolean {
   const now = Date.now();
   const record = loginAttempts.get(ip);
@@ -32,6 +42,12 @@ function isRateLimited(ip: string): boolean {
   return record.count > 5;
 }
 
+// --- UUID Masking for Logs ---
+function maskUUID(uuid: string): string {
+  if (uuid.length < 8) return '****';
+  return uuid.slice(0, 4) + '****-****-****-****-********' + uuid.slice(-4);
+}
+
 // --- ProxyIP Random Selection ---
 function getRandomProxyIP(): string {
   if (proxyIPs.length === 0) return '';
@@ -45,11 +61,11 @@ async function getUUIDFromConfig(): Promise<string | undefined> {
       const configText = await Deno.readTextFile(CONFIG_FILE);
       const config: Config = JSON.parse(configText);
       if (config.uuid && isValidUUID(config.uuid)) {
-        console.log(`Loaded UUID from ${CONFIG_FILE}: ${config.uuid}`);
+        console.log(`Loaded UUID from ${CONFIG_FILE}: ${maskUUID(config.uuid)}`);
         return config.uuid;
       }
     } catch (e) {
-      console.warn(`Error reading or parsing ${CONFIG_FILE}:`, e.message);
+      console.warn(`Error reading or parsing ${CONFIG_FILE}:`, (e as Error).message);
     }
   }
   return undefined;
@@ -59,9 +75,9 @@ async function saveUUIDToConfig(uuid: string): Promise<void> {
   try {
     const config: Config = { uuid: uuid };
     await Deno.writeTextFile(CONFIG_FILE, JSON.stringify(config, null, 2));
-    console.log(`Saved new UUID to ${CONFIG_FILE}: ${uuid}`);
+    console.log(`Saved new UUID to ${CONFIG_FILE}: ${maskUUID(uuid)}`);
   } catch (e) {
-    console.error(`Failed to save UUID to ${CONFIG_FILE}:`, e.message);
+    console.error(`Failed to save UUID to ${CONFIG_FILE}:`, (e as Error).message);
   }
 }
 
@@ -71,7 +87,7 @@ let userIDs: string[] = [];
 if (envUUID) {
   userIDs = envUUID.split(',').map(u => u.trim()).filter(isValidUUID);
   if (userIDs.length > 0) {
-    console.log(`Using UUIDs from environment: ${userIDs.join(', ')}`);
+    console.log(`Using UUIDs from environment: ${userIDs.map(maskUUID).join(', ')}`);
   }
 }
 
@@ -81,7 +97,7 @@ if (userIDs.length === 0) {
     userIDs.push(configUUID);
   } else {
     const newUUID = crypto.randomUUID();
-    console.log(`Generated new UUID: ${newUUID}`);
+    console.log(`Generated new UUID: ${maskUUID(newUUID)}`);
     await saveUUIDToConfig(newUUID);
     userIDs.push(newUUID);
   }
@@ -94,8 +110,11 @@ if (userIDs.length === 0) {
 const primaryUserID = userIDs[0];
 
 console.log(Deno.version);
-console.log(`UUIDs in use: ${userIDs.join(', ')}`);
+console.log(`UUIDs in use: ${userIDs.map(maskUUID).join(', ')}`);
 console.log(`WebSocket path: ${wsPath}`);
+
+// --- Connection Timeout ---
+const CONNECTION_TIMEOUT = 10000; // 10 seconds
 
 // --- STYLISH UI CSS & HTML HELPER ---
 const getHtml = (title: string, bodyContent: string) => `
@@ -263,6 +282,10 @@ const getHtml = (title: string, bodyContent: string) => `
         .footer a:hover {
             color: #94a3b8;
         }
+        .health-ok {
+            color: #4ade80;
+            font-weight: 600;
+        }
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
@@ -295,6 +318,15 @@ const getHtml = (title: string, bodyContent: string) => `
 </html>
 `;
 
+// --- Connection with Timeout ---
+async function connectWithTimeout(hostname: string, port: number, timeout: number): Promise<Deno.TcpConn> {
+  const conn = Deno.connect({ hostname, port });
+  const timer = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error(`Connection to ${hostname}:${port} timed out after ${timeout}ms`)), timeout);
+  });
+  return await Promise.race([conn, timer]);
+}
+
 Deno.serve(async (request: Request) => {
   const upgrade = request.headers.get('upgrade') || '';
 
@@ -309,6 +341,21 @@ Deno.serve(async (request: Request) => {
 
   // --- HTTP Handling (Web UI) ---
   const url = new URL(request.url);
+
+  // Health check endpoint
+  if (url.pathname === '/health') {
+    const healthInfo = {
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      uuidCount: userIDs.length,
+      proxyIPCount: proxyIPs.length,
+      wsPath: wsPath,
+    };
+    return new Response(JSON.stringify(healthInfo, null, 2), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 
   // Subscription endpoint — password protected separately
   if (url.pathname === '/sub') {
@@ -378,6 +425,7 @@ Deno.serve(async (request: Request) => {
           <div style="margin-top: 30px;">
               <a href="/config" class="btn">Get Configuration</a>
               <a href="/sub" class="btn" style="background: #7c3aed;">Subscription Link</a>
+              <a href="/health" class="btn" style="background: #059669;">Health Check</a>
           </div>
           <div class="footer">
               Powered by Deno Deploy
@@ -475,10 +523,10 @@ async function vlessOverWSHandler(request: Request) {
   };
   const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
   const readableWebSocketStream = makeReadableWebSocketStream(socket, earlyDataHeader, log);
-  let remoteSocketWapper: any = {
+  const remoteSocketWapper: { value: Deno.TcpConn | null } = {
     value: null,
   };
-  let udpStreamWrite: any = null;
+  let udpStreamWrite: ((chunk: Uint8Array) => void) | null = null;
   let isDns = false;
 
   readableWebSocketStream
@@ -508,14 +556,12 @@ async function vlessOverWSHandler(request: Request) {
           portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '} `;
           if (hasError) {
             throw new Error(message);
-            return;
           }
           if (isUDP) {
             if (portRemote === 53) {
               isDns = true;
             } else {
               throw new Error('UDP proxy only enable for DNS which is port 53');
-              return;
             }
           }
 
@@ -541,21 +587,34 @@ async function vlessOverWSHandler(request: Request) {
         },
         close() {
           log(`readableWebSocketStream is close`);
+          // TCP socket cleanup
+          if (remoteSocketWapper.value) {
+            try { remoteSocketWapper.value.close(); } catch (_) { /* already closed */ }
+          }
         },
         abort(reason) {
           log(`readableWebSocketStream is abort`, JSON.stringify(reason));
+          // TCP socket cleanup
+          if (remoteSocketWapper.value) {
+            try { remoteSocketWapper.value.close(); } catch (_) { /* already closed */ }
+          }
         },
       })
     )
     .catch((err) => {
       log('readableWebSocketStream pipeTo error', err);
+      // Ensure cleanup on error
+      if (remoteSocketWapper.value) {
+        try { remoteSocketWapper.value.close(); } catch (_) { /* already closed */ }
+      }
+      safeCloseWebSocket(socket);
     });
 
   return response;
 }
 
 async function handleTCPOutBound(
-  remoteSocket: { value: any },
+  remoteSocket: { value: Deno.TcpConn | null },
   addressRemote: string,
   portRemote: number,
   rawClientData: Uint8Array,
@@ -564,31 +623,43 @@ async function handleTCPOutBound(
   log: (info: string, event?: string) => void
 ) {
   async function connectAndWrite(address: string, port: number) {
-    const tcpSocket = await Deno.connect({
-      port: port,
-      hostname: address,
-    });
-
-    remoteSocket.value = tcpSocket;
-    log(`connected to ${address}:${port}`);
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(new Uint8Array(rawClientData));
-    writer.releaseLock();
-    return tcpSocket;
+    try {
+      const tcpSocket = await connectWithTimeout(address, port, CONNECTION_TIMEOUT);
+      remoteSocket.value = tcpSocket;
+      log(`connected to ${address}:${port}`);
+      const writer = tcpSocket.writable.getWriter();
+      await writer.write(new Uint8Array(rawClientData));
+      writer.releaseLock();
+      return tcpSocket;
+    } catch (e) {
+      log(`Failed to connect to ${address}:${port}: ${(e as Error).message}`);
+      throw e;
+    }
   }
 
   async function retry() {
-    const fallbackIP = getRandomProxyIP();
-    if (!fallbackIP) {
-      log('No proxy IP available for retry');
-      return;
+    try {
+      const fallbackIP = getRandomProxyIP();
+      if (!fallbackIP) {
+        log('No proxy IP available for retry');
+        safeCloseWebSocket(webSocket);
+        return;
+      }
+      const tcpSocket = await connectAndWrite(fallbackIP, portRemote);
+      remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+    } catch (e) {
+      log(`Retry failed: ${(e as Error).message}`);
+      safeCloseWebSocket(webSocket);
     }
-    const tcpSocket = await connectAndWrite(fallbackIP, portRemote);
-    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
   }
 
-  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-  remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+  try {
+    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+  } catch (e) {
+    log(`Initial connection failed: ${(e as Error).message}, attempting retry...`);
+    await retry();
+  }
 }
 
 function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader: string, log: (info: string, event?: string) => void) {
@@ -620,7 +691,7 @@ function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader
         controller.enqueue(earlyData);
       }
     },
-    pull(controller) {},
+    pull(_controller) {},
     cancel(reason) {
       if (readableStreamCancel) {
         return;
@@ -662,6 +733,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
   const command = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
 
   if (command === 1) {
+    // TCP
   } else if (command === 2) {
     isUDP = true;
   } else {
@@ -674,7 +746,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
   const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
   const portRemote = new DataView(portBuffer).getUint16(0);
 
-  let addressIndex = portIndex + 2;
+  const addressIndex = portIndex + 2;
   const addressBuffer = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1));
 
   const addressType = addressBuffer[0];
@@ -726,6 +798,8 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
 async function remoteSocketToWS(remoteSocket: Deno.TcpConn, webSocket: WebSocket, vlessResponseHeader: Uint8Array, retry: (() => Promise<void>) | null, log: (info: string, event?: string) => void) {
   let hasIncomingData = false;
+  let headerSent = false;
+
   await remoteSocket.readable
     .pipeTo(
       new WritableStream({
@@ -736,9 +810,9 @@ async function remoteSocketToWS(remoteSocket: Deno.TcpConn, webSocket: WebSocket
             controller.error('webSocket.readyState is not open, maybe close');
           }
 
-          if (vlessResponseHeader) {
+          if (!headerSent) {
             webSocket.send(new Uint8Array([...vlessResponseHeader, ...chunk]));
-            vlessResponseHeader = null;
+            headerSent = true;
           } else {
             webSocket.send(chunk);
           }
@@ -833,7 +907,7 @@ function stringify(arr: Uint8Array, offset = 0) {
 async function handleUDPOutBound(webSocket: WebSocket, vlessResponseHeader: Uint8Array, log: (info: string) => void) {
   let isVlessHeaderSent = false;
   const transformStream = new TransformStream({
-    start(controller) {},
+    start(_controller) {},
     transform(chunk, controller) {
       for (let index = 0; index < chunk.byteLength;) {
         const lengthBuffer = chunk.slice(index, index + 2);
@@ -843,7 +917,7 @@ async function handleUDPOutBound(webSocket: WebSocket, vlessResponseHeader: Uint
         controller.enqueue(udpData);
       }
     },
-    flush(controller) {},
+    flush(_controller) {},
   });
 
   transformStream.readable
