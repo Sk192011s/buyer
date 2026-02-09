@@ -8,7 +8,7 @@ const wsPath = Deno.env.get('WS_PATH') || '/ws';
 const webUsername = Deno.env.get('WEB_USERNAME') || 'admin';
 
 // 🔧 FIXED: Sticky Proxy IP — env variable ကနေ force-fix လုပ်လို့ရတယ်
-const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '';
+const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '34.142.215.5';
 
 const CONFIG_FILE = 'config.json';
 
