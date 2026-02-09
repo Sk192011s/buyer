@@ -5,7 +5,7 @@ const credit = Deno.env.get('CREDIT') || '';
 const webPassword = Deno.env.get('WEB_PASSWORD') || '';
 const wsPath = Deno.env.get('WS_PATH') || '/ws';
 const webUsername = Deno.env.get('WEB_USERNAME') || 'admin';
-const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '34.142.215.5';
+const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '34.142.187.195';
 const CONFIG_FILE = 'config.json';
 interface Config {
   uuid?: string;
