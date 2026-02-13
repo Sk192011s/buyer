@@ -4,8 +4,8 @@ const proxyIPs = (Deno.env.get('PROXYIP') || '').split(',').map(ip => ip.trim())
 const credit = Deno.env.get('CREDIT') || '';
 const webPassword = Deno.env.get('WEB_PASSWORD') || '';
 const wsPath = Deno.env.get('WS_PATH') || '/ws';
-const webUsername = Deno.env.get('WEB_USERNAME') || 'admin';
-const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '34.142.187.195';
+const webUsername = Deno.env.get('WEB_USERNAME') || '';
+const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '';
 const CONFIG_FILE = 'config.json';
 interface Config {
   uuid?: string;
