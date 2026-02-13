@@ -383,6 +383,14 @@ Deno.serve(async (request: Request) => {
   }
   switch (url.pathname) {
     case '/': {
+    const content = `
+        <h1>Hello</h1>
+    `;
+    return new Response(getHtml('Hello', content), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+}
+
       const content = `
           <h1>⚡ Deno VLESS Proxy</h1>
           <p>Your secure VLESS WebSocket proxy server is active and running efficiently.</p>
