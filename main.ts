@@ -98,7 +98,7 @@ const primaryUserID = userIDs[0];
 console.log(Deno.version);
 console.log(`UUIDs in use: ${userIDs.map(maskUUID).join(', ')}`);
 console.log(`WebSocket path: ${wsPath}`);
-console.log(`Fixed Proxy IP: ${fixedProxyIP || '(none — direct connection)'}`); 
+console.log(`Fixed Proxy IP: ${fixedProxyIP || '(none — direct connection)'}`);
 const CONNECTION_TIMEOUT = 10000;
 const getHtml = (title: string, bodyContent: string) => `
 <!DOCTYPE html>
@@ -323,7 +323,7 @@ Deno.serve(async (request: Request) => {
       timestamp: new Date().toISOString(),
       uuidCount: userIDs.length,
       proxyIPCount: proxyIPs.length,
-      fixedProxyIP: fixedProxyIP || '(none)', 
+      fixedProxyIP: fixedProxyIP || '(none)',
       wsPath: wsPath,
     };
     return new Response(JSON.stringify(healthInfo, null, 2), {
@@ -360,50 +360,35 @@ Deno.serve(async (request: Request) => {
       },
     });
   }
-  if (webPassword) {
-    const clientIP = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-                     request.headers.get('cf-connecting-ip') || 'unknown';
-    if (isRateLimited(clientIP)) {
-      return new Response("Too Many Requests. Try again later.", {
-        status: 429,
-        headers: { "Content-Type": "text/plain" },
-      });
-    }
-    const authHeader = request.headers.get("Authorization");
-    const expectedAuth = `Basic ${btoa(`${webUsername}:${webPassword}`)}`;
-    if (authHeader !== expectedAuth) {
-      return new Response("Unauthorized Access", {
-        status: 401,
-        headers: {
-          "WWW-Authenticate": 'Basic realm="VLESS Proxy Admin"',
-          "Content-Type": "text/plain"
-        },
-      });
+  if (url.pathname === '/config' || url.pathname === '/sub') {
+    if (webPassword) {
+      const clientIP = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+                       request.headers.get('cf-connecting-ip') || 'unknown';
+      if (isRateLimited(clientIP)) {
+        return new Response("Too Many Requests. Try again later.", {
+          status: 429,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
+      const authHeader = request.headers.get("Authorization");
+      const expectedAuth = `Basic ${btoa(`${webUsername}:${webPassword}`)}`;
+      if (authHeader !== expectedAuth) {
+        return new Response("Unauthorized Access", {
+          status: 401,
+          headers: {
+            "WWW-Authenticate": 'Basic realm="VLESS Proxy Admin"',
+            "Content-Type": "text/plain"
+          },
+        });
+      }
     }
   }
   switch (url.pathname) {
     case '/': {
-    const content = `
-        <h1>Hello</h1>
-    `;
-    return new Response(getHtml('Hello', content), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-    });
-}
-
       const content = `
-          <h1>⚡ Deno VLESS Proxy</h1>
-          <p>Your secure VLESS WebSocket proxy server is active and running efficiently.</p>
-          <div style="margin-top: 30px;">
-              <a href="/config" class="btn">Get Configuration</a>
-              <a href="/sub" class="btn" style="background: #7c3aed;">Subscription Link</a>
-              <a href="/health" class="btn" style="background: #059669;">Health Check</a>
-          </div>
-          <div class="footer">
-              Powered by Deno Deploy
-          </div>
+          <h1>Hello</h1>
       `;
-      return new Response(getHtml('Deno Proxy Status', content), {
+      return new Response(getHtml('Hello', content), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
@@ -450,7 +435,7 @@ Deno.serve(async (request: Request) => {
         `;
       });
       const content = `
-          <h1>🚀 Server Configuration</h1>
+          <h1>Server Configuration</h1>
           <p>Import these settings into your V2Ray or Clash client.</p>
           ${userSections}
           <div class="config-box" style="margin-top: 30px;">
