@@ -1,4 +1,6 @@
-import { exists } from "https://deno.land/std/fs/exists.ts";
+import { exists } from "https://deno.land/std@0.224.0/fs/exists.ts";
+
+// ─── Environment Variables ───────────────────────────────────────────
 const envUUID = Deno.env.get('UUID') || '';
 const proxyIPs = (Deno.env.get('PROXYIP') || '').split(',').map(ip => ip.trim()).filter(Boolean);
 const credit = Deno.env.get('CREDIT') || '';
@@ -7,38 +9,132 @@ const wsPath = Deno.env.get('WS_PATH') || '/ws';
 const webUsername = Deno.env.get('WEB_USERNAME') || '';
 const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '';
 const CONFIG_FILE = 'config.json';
+
 interface Config {
   uuid?: string;
 }
+
+// ─── HTML Escape (XSS Prevention) ───────────────────────────────────
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+// ─── Constant-Time Comparison ────────────────────────────────────────
+function constantTimeEqual(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const bufA = encoder.encode(a);
+  const bufB = encoder.encode(b);
+  if (bufA.length !== bufB.length) {
+    // still iterate to avoid timing leak on length
+    let dummy = 0;
+    for (let i = 0; i < bufA.length; i++) {
+      dummy |= bufA[i] ^ (bufB[i % bufB.length] || 0);
+    }
+    return false;
+  }
+  let result = 0;
+  for (let i = 0; i < bufA.length; i++) {
+    result |= bufA[i] ^ bufB[i];
+  }
+  return result === 0;
+}
+
+// ─── Rate Limiter ────────────────────────────────────────────────────
+const MAX_TRACKED_IPS = 10000;
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000;
+const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const loginAttempts = new Map<string, { count: number; lastAttempt: number }>();
+
 setInterval(() => {
   const now = Date.now();
   for (const [ip, record] of loginAttempts) {
-    if (now - record.lastAttempt > 15 * 60 * 1000) {
+    if (now - record.lastAttempt > RATE_LIMIT_WINDOW) {
       loginAttempts.delete(ip);
     }
   }
 }, 30 * 60 * 1000);
+
+function pruneRateLimitMap(): void {
+  if (loginAttempts.size > MAX_TRACKED_IPS) {
+    const entries = Array.from(loginAttempts.entries());
+    entries.sort((a, b) => a[1].lastAttempt - b[1].lastAttempt);
+    const toRemove = Math.floor(entries.length / 2);
+    for (let i = 0; i < toRemove; i++) {
+      loginAttempts.delete(entries[i][0]);
+    }
+  }
+}
+
 function isRateLimited(ip: string): boolean {
+  pruneRateLimitMap();
   const now = Date.now();
   const record = loginAttempts.get(ip);
   if (!record) {
     loginAttempts.set(ip, { count: 1, lastAttempt: now });
     return false;
   }
-  if (now - record.lastAttempt > 15 * 60 * 1000) {
+  if (now - record.lastAttempt > RATE_LIMIT_WINDOW) {
     loginAttempts.set(ip, { count: 1, lastAttempt: now });
     return false;
   }
   record.count++;
   record.lastAttempt = now;
-  return record.count > 5;
+  return record.count > RATE_LIMIT_MAX_ATTEMPTS;
 }
+
+function clearRateLimit(ip: string): void {
+  loginAttempts.delete(ip);
+}
+
+// ─── Auth Middleware ─────────────────────────────────────────────────
+function requireAuth(request: Request): Response | null {
+  if (!webPassword) return null;
+
+  const clientIP = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+    || request.headers.get('cf-connecting-ip') || 'unknown';
+
+  if (isRateLimited(clientIP)) {
+    return new Response("Too Many Requests. Try again later.", {
+      status: 429,
+      headers: { "Content-Type": "text/plain" },
+    });
+  }
+
+  const authHeader = request.headers.get("Authorization") || '';
+  const expectedAuth = `Basic ${btoa(`${webUsername}:${webPassword}`)}`;
+
+  if (!constantTimeEqual(authHeader, expectedAuth)) {
+    return new Response("Unauthorized", {
+      status: 401,
+      headers: {
+        "WWW-Authenticate": 'Basic realm="VLESS Proxy Admin"',
+        "Content-Type": "text/plain",
+      },
+    });
+  }
+
+  clearRateLimit(clientIP);
+  return null;
+}
+
+// ─── UUID Helpers ────────────────────────────────────────────────────
 function maskUUID(uuid: string): string {
   if (uuid.length < 8) return '****';
   return uuid.slice(0, 4) + '****-****-****-****-********' + uuid.slice(-4);
 }
-let fixedProxyIP: string = '';
+
+function isValidUUID(uuid: string): boolean {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(uuid);
+}
+
+// ─── Proxy IP Selection ──────────────────────────────────────────────
+let fixedProxyIP = '';
 if (stickyProxyIPEnv) {
   fixedProxyIP = stickyProxyIPEnv.trim();
   console.log(`Using STICKY_PROXYIP (forced): ${fixedProxyIP}`);
@@ -46,9 +142,12 @@ if (stickyProxyIPEnv) {
   fixedProxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
   console.log(`Selected fixed Proxy IP from list: ${fixedProxyIP} (will not change until restart)`);
 }
+
 function getFixedProxyIP(): string {
   return fixedProxyIP;
 }
+
+// ─── Config File ─────────────────────────────────────────────────────
 async function getUUIDFromConfig(): Promise<string | undefined> {
   if (await exists(CONFIG_FILE)) {
     try {
@@ -64,6 +163,7 @@ async function getUUIDFromConfig(): Promise<string | undefined> {
   }
   return undefined;
 }
+
 async function saveUUIDToConfig(uuid: string): Promise<void> {
   try {
     const config: Config = { uuid: uuid };
@@ -73,17 +173,20 @@ async function saveUUIDToConfig(uuid: string): Promise<void> {
     console.error(`Failed to save UUID to ${CONFIG_FILE}:`, (e as Error).message);
   }
 }
+
+// ─── UUID Initialization ─────────────────────────────────────────────
 let userIDs: string[] = [];
 if (envUUID) {
-  userIDs = envUUID.split(',').map(u => u.trim()).filter(isValidUUID);
+  userIDs = envUUID.split(',').map(u => u.trim().toLowerCase()).filter(isValidUUID);
   if (userIDs.length > 0) {
     console.log(`Using UUIDs from environment: ${userIDs.map(maskUUID).join(', ')}`);
   }
 }
+
 if (userIDs.length === 0) {
   const configUUID = await getUUIDFromConfig();
   if (configUUID) {
-    userIDs.push(configUUID);
+    userIDs.push(configUUID.toLowerCase());
   } else {
     const newUUID = crypto.randomUUID();
     console.log(`Generated new UUID: ${maskUUID(newUUID)}`);
@@ -91,22 +194,49 @@ if (userIDs.length === 0) {
     userIDs.push(newUUID);
   }
 }
+
 if (userIDs.length === 0) {
   throw new Error('No valid UUID available');
 }
+
 const primaryUserID = userIDs[0];
 console.log(Deno.version);
 console.log(`UUIDs in use: ${userIDs.map(maskUUID).join(', ')}`);
 console.log(`WebSocket path: ${wsPath}`);
 console.log(`Fixed Proxy IP: ${fixedProxyIP || '(none — direct connection)'}`);
+
+// ─── Connection Tracking & Graceful Shutdown ─────────────────────────
+const activeConnections = new Set<Deno.TcpConn>();
 const CONNECTION_TIMEOUT = 10000;
+
+function trackConnection(conn: Deno.TcpConn): void {
+  activeConnections.add(conn);
+}
+
+function untrackConnection(conn: Deno.TcpConn): void {
+  activeConnections.delete(conn);
+}
+
+try {
+  Deno.addSignalListener("SIGINT", () => {
+    console.log("SIGINT received, shutting down...");
+    for (const conn of activeConnections) {
+      try { conn.close(); } catch (_) { /* ignore */ }
+    }
+    Deno.exit(0);
+  });
+} catch (_) {
+  // Signal listeners may not be available on all platforms
+}
+
+// ─── HTML Template ───────────────────────────────────────────────────
 const getHtml = (title: string, bodyContent: string) => `
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${title}</title>
+    <title>${escapeHtml(title)}</title>
     <style>
         :root {
             --bg-color: #0f172a;
@@ -214,16 +344,9 @@ const getHtml = (title: string, bodyContent: string) => `
             overflow-y: auto;
             padding-right: 10px;
         }
-        pre::-webkit-scrollbar {
-            width: 6px;
-        }
-        pre::-webkit-scrollbar-track {
-            background: transparent;
-        }
-        pre::-webkit-scrollbar-thumb {
-            background: #334155;
-            border-radius: 3px;
-        }
+        pre::-webkit-scrollbar { width: 6px; }
+        pre::-webkit-scrollbar-track { background: transparent; }
+        pre::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
         .copy-btn {
             background: rgba(59, 130, 246, 0.1);
             color: #60a5fa;
@@ -234,9 +357,7 @@ const getHtml = (title: string, bodyContent: string) => `
             cursor: pointer;
             transition: all 0.2s;
         }
-        .copy-btn:hover {
-            background: rgba(59, 130, 246, 0.2);
-        }
+        .copy-btn:hover { background: rgba(59, 130, 246, 0.2); }
         .user-section {
             border-top: 1px solid var(--border);
             margin-top: 30px;
@@ -262,13 +383,8 @@ const getHtml = (title: string, bodyContent: string) => `
             text-decoration: none;
             transition: color 0.2s;
         }
-        .footer a:hover {
-            color: #94a3b8;
-        }
-        .health-ok {
-            color: #4ade80;
-            font-weight: 600;
-        }
+        .footer a:hover { color: #94a3b8; }
+        .health-ok { color: #4ade80; font-weight: 600; }
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
@@ -332,54 +448,8 @@ const getHtml = (title: string, bodyContent: string) => `
             border-radius: 12px;
             padding: 20px 12px;
         }
-        .feature-icon {
-            font-size: 1.8rem;
-            margin-bottom: 8px;
-        }
-        .feature-name {
-            font-size: 0.85rem;
-            color: #94a3b8;
-            font-weight: 500;
-        }
-        .email-form {
-            display: flex;
-            gap: 10px;
-            max-width: 420px;
-            margin: 0 auto;
-        }
-        .email-input {
-            flex: 1;
-            padding: 12px 18px;
-            border-radius: 12px;
-            border: 1px solid var(--border);
-            background: rgba(15, 23, 42, 0.6);
-            color: var(--text-main);
-            font-size: 0.95rem;
-            outline: none;
-            transition: border-color 0.2s;
-        }
-        .email-input:focus {
-            border-color: var(--primary);
-        }
-        .email-input::placeholder {
-            color: #475569;
-        }
-        .notify-btn {
-            padding: 12px 24px;
-            border-radius: 12px;
-            background: var(--primary);
-            color: white;
-            border: none;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            font-size: 0.95rem;
-            white-space: nowrap;
-        }
-        .notify-btn:hover {
-            background: var(--primary-hover);
-            transform: translateY(-1px);
-        }
+        .feature-icon { font-size: 1.8rem; margin-bottom: 8px; }
+        .feature-name { font-size: 0.85rem; color: #94a3b8; font-weight: 500; }
         .toast {
             position: fixed;
             bottom: 30px;
@@ -396,9 +466,7 @@ const getHtml = (title: string, bodyContent: string) => `
             backdrop-filter: blur(8px);
             z-index: 100;
         }
-        .toast.show {
-            transform: translateX(-50%) translateY(0);
-        }
+        .toast.show { transform: translateX(-50%) translateY(0); }
         @media (max-width: 600px) {
             .container { padding: 28px 20px; }
             h1 { font-size: 1.8rem; }
@@ -407,7 +475,6 @@ const getHtml = (title: string, bodyContent: string) => `
             .countdown-number { font-size: 1.6rem; }
             .feature-grid { grid-template-columns: repeat(3, 1fr); gap: 10px; }
             .feature-item { padding: 14px 8px; }
-            .email-form { flex-direction: column; }
         }
     </style>
 </head>
@@ -436,51 +503,59 @@ const getHtml = (title: string, bodyContent: string) => `
 </body>
 </html>
 `;
+
+// ─── Connection with Timeout ─────────────────────────────────────────
 async function connectWithTimeout(hostname: string, port: number, timeout: number): Promise<Deno.TcpConn> {
-  const conn = Deno.connect({ hostname, port });
+  let timeoutId: number;
+  const connPromise = Deno.connect({ hostname, port });
   const timer = new Promise<never>((_, reject) => {
-    setTimeout(() => reject(new Error(`Connection to ${hostname}:${port} timed out after ${timeout}ms`)), timeout);
+    timeoutId = setTimeout(
+      () => reject(new Error(`Connection to ${hostname}:${port} timed out after ${timeout}ms`)),
+      timeout
+    );
   });
-  return await Promise.race([conn, timer]);
+  try {
+    const result = await Promise.race([connPromise, timer]);
+    clearTimeout(timeoutId!);
+    return result;
+  } catch (e) {
+    clearTimeout(timeoutId!);
+    connPromise.then(c => { try { c.close(); } catch (_) { /* ignore */ } }).catch(() => {});
+    throw e;
+  }
 }
+
+// ─── Main Server ─────────────────────────────────────────────────────
 Deno.serve(async (request: Request) => {
   const upgrade = request.headers.get('upgrade') || '';
-  if (upgrade.toLowerCase() == 'websocket') {
+  if (upgrade.toLowerCase() === 'websocket') {
     const url = new URL(request.url);
     if (url.pathname !== wsPath) {
       return new Response('Not Found', { status: 404 });
     }
     return await vlessOverWSHandler(request);
   }
+
   const url = new URL(request.url);
+
+  // ── Health (minimal info, no auth needed) ──
   if (url.pathname === '/health') {
-    const healthInfo = {
+    return new Response(JSON.stringify({
       status: 'ok',
       timestamp: new Date().toISOString(),
-      uuidCount: userIDs.length,
-      proxyIPCount: proxyIPs.length,
-      fixedProxyIP: fixedProxyIP || '(none)',
-      wsPath: wsPath,
-    };
-    return new Response(JSON.stringify(healthInfo, null, 2), {
+    }, null, 2), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     });
   }
+
+  // ── Protected routes: /sub and /config ──
+  if (url.pathname === '/sub' || url.pathname === '/config') {
+    const authResponse = requireAuth(request);
+    if (authResponse) return authResponse;
+  }
+
   if (url.pathname === '/sub') {
-    if (webPassword) {
-      const authHeader = request.headers.get("Authorization");
-      const expectedAuth = `Basic ${btoa(`${webUsername}:${webPassword}`)}`;
-      if (authHeader !== expectedAuth) {
-        return new Response("Unauthorized", {
-          status: 401,
-          headers: {
-            "WWW-Authenticate": 'Basic realm="VLESS Proxy Admin"',
-            "Content-Type": "text/plain"
-          },
-        });
-      }
-    }
     const hostName = url.hostname;
     const port = url.port || (url.protocol === 'https:' ? 443 : 80);
     const allLinks = userIDs.map((uid, index) => {
@@ -492,33 +567,11 @@ Deno.serve(async (request: Request) => {
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
         'Profile-Update-Interval': '12',
-        'Subscription-Userinfo': 'upload=0; download=0; total=10737418240; expire=0'
+        'Subscription-Userinfo': 'upload=0; download=0; total=10737418240; expire=0',
       },
     });
   }
-  if (url.pathname === '/config' || url.pathname === '/sub') {
-    if (webPassword) {
-      const clientIP = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-                       request.headers.get('cf-connecting-ip') || 'unknown';
-      if (isRateLimited(clientIP)) {
-        return new Response("Too Many Requests. Try again later.", {
-          status: 429,
-          headers: { "Content-Type": "text/plain" },
-        });
-      }
-      const authHeader = request.headers.get("Authorization");
-      const expectedAuth = `Basic ${btoa(`${webUsername}:${webPassword}`)}`;
-      if (authHeader !== expectedAuth) {
-        return new Response("Unauthorized Access", {
-          status: 401,
-          headers: {
-            "WWW-Authenticate": 'Basic realm="VLESS Proxy Admin"',
-            "Content-Type": "text/plain"
-          },
-        });
-      }
-    }
-  }
+
   switch (url.pathname) {
     case '/': {
       const content = `
@@ -563,20 +616,11 @@ Deno.serve(async (request: Request) => {
               </div>
           </div>
 
-          <p style="margin-bottom: 1rem; font-size: 0.95rem;">Get notified when we launch</p>
-          <div class="email-form">
-              <input type="email" class="email-input" id="emailInput" placeholder="Enter your email">
-              <button class="notify-btn" onclick="handleNotify()">Notify Me</button>
-          </div>
-
           <div class="footer">
               <p>&copy; 2026 NovaByte Cloud Inc. All rights reserved.</p>
           </div>
 
-          <div class="toast" id="toast">Thanks! We'll notify you at launch.</div>
-
           <script>
-              // Countdown - always 90 days from now
               const launchDate = new Date();
               launchDate.setDate(launchDate.getDate() + 90);
               
@@ -594,36 +638,29 @@ Deno.serve(async (request: Request) => {
               }
               updateCountdown();
               setInterval(updateCountdown, 1000);
-
-              function handleNotify() {
-                  const email = document.getElementById('emailInput').value;
-                  if (email && email.includes('@')) {
-                      const toast = document.getElementById('toast');
-                      toast.classList.add('show');
-                      document.getElementById('emailInput').value = '';
-                      setTimeout(() => toast.classList.remove('show'), 3000);
-                  }
-              }
-
-              document.getElementById('emailInput').addEventListener('keypress', function(e) {
-                  if (e.key === 'Enter') handleNotify();
-              });
           </script>
       `;
       return new Response(getHtml('NovaByte Cloud - Coming Soon', content), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
+
     case '/config': {
       const hostName = url.hostname;
       const port = url.port || (url.protocol === 'https:' ? 443 : 80);
       let userSections = '';
+
       userIDs.forEach((uid, index) => {
-        const tag = credit ? `${credit}-${index + 1}` : `${hostName}-${index + 1}`;
-        const vlessLink = `vless://${uid}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=${encodeURIComponent(wsPath + '?ed=2048')}#${tag}`;
+        const rawTag = credit ? `${credit}-${index + 1}` : `${hostName}-${index + 1}`;
+        const safeTag = escapeHtml(rawTag);
+        const safeHostName = escapeHtml(hostName);
+        const safeWsPath = escapeHtml(wsPath);
+
+        const vlessLink = `vless://${uid}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=${encodeURIComponent(wsPath + '?ed=2048')}#${rawTag}`;
+
         const clashConfig = `
 - type: vless
-  name: ${tag}
+  name: ${rawTag}
   server: ${hostName}
   port: ${port}
   uuid: ${uid}
@@ -636,6 +673,7 @@ Deno.serve(async (request: Request) => {
     path: "${wsPath}?ed=2048"
     headers:
       host: ${hostName}`;
+
         userSections += `
           <div class="${index > 0 ? 'user-section' : ''}">
               <span class="user-label">User ${index + 1}</span>
@@ -644,18 +682,20 @@ Deno.serve(async (request: Request) => {
                       <span class="config-title">VLESS URI (V2RayNG / v2rayN)</span>
                       <button class="copy-btn" onclick="copyToClipboard('vless-uri-${index}', this)">Copy</button>
                   </div>
-                  <pre id="vless-uri-${index}">${vlessLink}</pre>
+                  <pre id="vless-uri-${index}">${escapeHtml(vlessLink)}</pre>
               </div>
               <div class="config-box">
                   <div class="config-header">
                       <span class="config-title">Clash Meta YAML</span>
                       <button class="copy-btn" onclick="copyToClipboard('clash-config-${index}', this)">Copy</button>
                   </div>
-                  <pre id="clash-config-${index}">${clashConfig.trim()}</pre>
+                  <pre id="clash-config-${index}">${escapeHtml(clashConfig.trim())}</pre>
               </div>
           </div>
         `;
       });
+
+      const safeHostForSub = escapeHtml(url.hostname);
       const content = `
           <h1>Server Configuration</h1>
           <p>Import these settings into your V2Ray or Clash client.</p>
@@ -665,7 +705,7 @@ Deno.serve(async (request: Request) => {
                   <span class="config-title">Subscription URL</span>
                   <button class="copy-btn" onclick="copyToClipboard('sub-url', this)">Copy</button>
               </div>
-              <pre id="sub-url">https://${hostName}/sub</pre>
+              <pre id="sub-url">https://${safeHostForSub}/sub</pre>
           </div>
           <div class="footer">
               <a href="/">Back to Home</a>
@@ -676,27 +716,34 @@ Deno.serve(async (request: Request) => {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
+
     default:
       return new Response(getHtml('404', '<h1>404 Not Found</h1><p>The path you requested does not exist.</p><a href="/" class="btn">Go Home</a>'), {
         status: 404,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
   }
 });
+
+// ─── VLESS over WebSocket Handler ────────────────────────────────────
 async function vlessOverWSHandler(request: Request) {
   const { socket, response } = Deno.upgradeWebSocket(request);
+
   let address = '';
   let portWithRandomLog = '';
   const log = (info: string, event = '') => {
     console.log(`[${address}:${portWithRandomLog}] ${info}`, event);
   };
+
   const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
   const readableWebSocketStream = makeReadableWebSocketStream(socket, earlyDataHeader, log);
-  const remoteSocketWapper: { value: Deno.TcpConn | null } = {
+
+  const remoteSocketWrapper: { value: Deno.TcpConn | null } = {
     value: null,
   };
   let udpStreamWrite: ((chunk: Uint8Array) => void) | null = null;
   let isDns = false;
+
   readableWebSocketStream
     .pipeTo(
       new WritableStream({
@@ -704,12 +751,16 @@ async function vlessOverWSHandler(request: Request) {
           if (isDns && udpStreamWrite) {
             return udpStreamWrite(chunk);
           }
-          if (remoteSocketWapper.value) {
-            const writer = remoteSocketWapper.value.writable.getWriter();
-            await writer.write(new Uint8Array(chunk));
-            writer.releaseLock();
+          if (remoteSocketWrapper.value) {
+            const writer = remoteSocketWrapper.value.writable.getWriter();
+            try {
+              await writer.write(new Uint8Array(chunk));
+            } finally {
+              writer.releaseLock();
+            }
             return;
           }
+
           const {
             hasError,
             message,
@@ -719,20 +770,25 @@ async function vlessOverWSHandler(request: Request) {
             vlessVersion = new Uint8Array([0, 0]),
             isUDP,
           } = processVlessHeader(chunk, userIDs);
+
           address = addressRemote;
           portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '} `;
+
           if (hasError) {
             throw new Error(message);
           }
+
           if (isUDP) {
             if (portRemote === 53) {
               isDns = true;
             } else {
-              throw new Error('UDP proxy only enable for DNS which is port 53');
+              throw new Error('UDP proxy only enabled for DNS which is port 53');
             }
           }
+
           const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
           const rawClientData = chunk.slice(rawDataIndex);
+
           if (isDns) {
             console.log('isDns:', isDns);
             const { write } = await handleUDPOutBound(socket, vlessResponseHeader, log);
@@ -740,8 +796,9 @@ async function vlessOverWSHandler(request: Request) {
             udpStreamWrite(rawClientData);
             return;
           }
+
           handleTCPOutBound(
-            remoteSocketWapper,
+            remoteSocketWrapper,
             addressRemote,
             portRemote,
             rawClientData,
@@ -751,28 +808,33 @@ async function vlessOverWSHandler(request: Request) {
           );
         },
         close() {
-          log(`readableWebSocketStream is close`);
-          if (remoteSocketWapper.value) {
-            try { remoteSocketWapper.value.close(); } catch (_) {  }
-          }
+          log(`readableWebSocketStream is closed`);
+          safeCloseRemote(remoteSocketWrapper.value);
         },
         abort(reason) {
-          log(`readableWebSocketStream is abort`, JSON.stringify(reason));
-          if (remoteSocketWapper.value) {
-            try { remoteSocketWapper.value.close(); } catch (_) {  }
-          }
+          log(`readableWebSocketStream is aborted`, JSON.stringify(reason));
+          safeCloseRemote(remoteSocketWrapper.value);
         },
       })
     )
     .catch((err) => {
       log('readableWebSocketStream pipeTo error', err);
-      if (remoteSocketWapper.value) {
-        try { remoteSocketWapper.value.close(); } catch (_) {  }
-      }
+      safeCloseRemote(remoteSocketWrapper.value);
       safeCloseWebSocket(socket);
     });
+
   return response;
 }
+
+// ─── Safe Close Remote TCP ───────────────────────────────────────────
+function safeCloseRemote(conn: Deno.TcpConn | null): void {
+  if (conn) {
+    untrackConnection(conn);
+    try { conn.close(); } catch (_) { /* ignore */ }
+  }
+}
+
+// ─── TCP Outbound Handler ────────────────────────────────────────────
 async function handleTCPOutBound(
   remoteSocket: { value: Deno.TcpConn | null },
   addressRemote: string,
@@ -786,16 +848,21 @@ async function handleTCPOutBound(
     try {
       const tcpSocket = await connectWithTimeout(address, port, CONNECTION_TIMEOUT);
       remoteSocket.value = tcpSocket;
+      trackConnection(tcpSocket);
       log(`connected to ${address}:${port}`);
       const writer = tcpSocket.writable.getWriter();
-      await writer.write(new Uint8Array(rawClientData));
-      writer.releaseLock();
+      try {
+        await writer.write(new Uint8Array(rawClientData));
+      } finally {
+        writer.releaseLock();
+      }
       return tcpSocket;
     } catch (e) {
       log(`Failed to connect to ${address}:${port}: ${(e as Error).message}`);
       throw e;
     }
   }
+
   async function retry() {
     try {
       const fallbackIP = getFixedProxyIP();
@@ -812,6 +879,7 @@ async function handleTCPOutBound(
       safeCloseWebSocket(webSocket);
     }
   }
+
   try {
     const tcpSocket = await connectAndWrite(addressRemote, portRemote);
     remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
@@ -820,28 +888,42 @@ async function handleTCPOutBound(
     await retry();
   }
 }
-function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader: string, log: (info: string, event?: string) => void) {
+
+// ─── Readable WebSocket Stream ───────────────────────────────────────
+function makeReadableWebSocketStream(
+  webSocketServer: WebSocket,
+  earlyDataHeader: string,
+  log: (info: string, event?: string) => void
+) {
   let readableStreamCancel = false;
   const stream = new ReadableStream({
     start(controller) {
       webSocketServer.addEventListener('message', (event) => {
-        if (readableStreamCancel) {
-          return;
+        if (readableStreamCancel) return;
+        const data = event.data;
+        if (data instanceof ArrayBuffer) {
+          controller.enqueue(data);
+        } else if (data instanceof Blob) {
+          data.arrayBuffer().then(buf => {
+            if (!readableStreamCancel) controller.enqueue(buf);
+          }).catch(err => {
+            log('Blob to ArrayBuffer error', String(err));
+          });
         }
-        const message = event.data;
-        controller.enqueue(message);
+        // string type is not valid for VLESS binary protocol, ignore
       });
+
       webSocketServer.addEventListener('close', () => {
         safeCloseWebSocket(webSocketServer);
-        if (readableStreamCancel) {
-          return;
-        }
+        if (readableStreamCancel) return;
         controller.close();
       });
+
       webSocketServer.addEventListener('error', (err) => {
         log('webSocketServer has error');
         controller.error(err);
       });
+
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
       if (error) {
         controller.error(error);
@@ -851,9 +933,7 @@ function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader
     },
     pull(_controller) {},
     cancel(reason) {
-      if (readableStreamCancel) {
-        return;
-      }
+      if (readableStreamCancel) return;
       log(`ReadableStream was canceled, due to ${reason}`);
       readableStreamCancel = true;
       safeCloseWebSocket(webSocketServer);
@@ -861,58 +941,102 @@ function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader
   });
   return stream;
 }
+
+// ─── VLESS Header Parser ─────────────────────────────────────────────
 function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
   if (vlessBuffer.byteLength < 24) {
-    return {
-      hasError: true,
-      message: 'invalid data',
-    };
+    return { hasError: true, message: 'invalid data' };
   }
+
   const version = new Uint8Array(vlessBuffer.slice(0, 1));
+  const incomingUUID = stringify(new Uint8Array(vlessBuffer.slice(1, 17))).toLowerCase();
+
+  // Constant-time UUID validation
   let isValidUser = false;
-  let isUDP = false;
-  const incomingUUID = stringify(new Uint8Array(vlessBuffer.slice(1, 17)));
-  if (validUserIDs.includes(incomingUUID)) {
-    isValidUser = true;
+  for (const id of validUserIDs) {
+    if (constantTimeEqual(id, incomingUUID)) {
+      isValidUser = true;
+    }
+    // intentionally no break — constant-time
   }
+
   if (!isValidUser) {
-    return {
-      hasError: true,
-      message: 'invalid user',
-    };
+    return { hasError: true, message: 'invalid user' };
   }
+
   const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
+
+  // Bounds check for optLength
+  if (18 + optLength + 1 > vlessBuffer.byteLength) {
+    return { hasError: true, message: 'invalid header: optLength exceeds buffer' };
+  }
+
   const command = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
+  let isUDP = false;
+
   if (command === 1) {
+    // TCP
   } else if (command === 2) {
     isUDP = true;
   } else {
     return {
       hasError: true,
-      message: `command ${command} is not support, command 01-tcp,02-udp,03-mux`,
+      message: `command ${command} is not supported, command 01-tcp, 02-udp, 03-mux`,
     };
   }
+
   const portIndex = 18 + optLength + 1;
+
+  // Bounds check for port
+  if (portIndex + 2 > vlessBuffer.byteLength) {
+    return { hasError: true, message: 'invalid header: buffer too short for port' };
+  }
+
   const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
   const portRemote = new DataView(portBuffer).getUint16(0);
+
   const addressIndex = portIndex + 2;
+
+  // Bounds check for address type
+  if (addressIndex + 1 > vlessBuffer.byteLength) {
+    return { hasError: true, message: 'invalid header: buffer too short for address type' };
+  }
+
   const addressBuffer = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1));
   const addressType = addressBuffer[0];
   let addressLength = 0;
   let addressValueIndex = addressIndex + 1;
   let addressValue = '';
+
   switch (addressType) {
-    case 1:
+    case 1: {
+      // IPv4
       addressLength = 4;
+      if (addressValueIndex + addressLength > vlessBuffer.byteLength) {
+        return { hasError: true, message: 'invalid header: buffer too short for IPv4 address' };
+      }
       addressValue = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join('.');
       break;
-    case 2:
+    }
+    case 2: {
+      // Domain
+      if (addressValueIndex + 1 > vlessBuffer.byteLength) {
+        return { hasError: true, message: 'invalid header: buffer too short for domain length' };
+      }
       addressLength = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
       addressValueIndex += 1;
+      if (addressValueIndex + addressLength > vlessBuffer.byteLength) {
+        return { hasError: true, message: 'invalid header: domain length exceeds buffer' };
+      }
       addressValue = new TextDecoder().decode(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       break;
-    case 3:
+    }
+    case 3: {
+      // IPv6
       addressLength = 16;
+      if (addressValueIndex + addressLength > vlessBuffer.byteLength) {
+        return { hasError: true, message: 'invalid header: buffer too short for IPv6 address' };
+      }
       const dataView = new DataView(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       const ipv6: string[] = [];
       for (let i = 0; i < 8; i++) {
@@ -920,18 +1044,21 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
       }
       addressValue = ipv6.join(':');
       break;
+    }
     default:
       return {
         hasError: true,
-        message: `invild addressType is ${addressType}`,
+        message: `invalid addressType is ${addressType}`,
       };
   }
+
   if (!addressValue) {
     return {
       hasError: true,
       message: `addressValue is empty, addressType is ${addressType}`,
     };
   }
+
   return {
     hasError: false,
     addressRemote: addressValue,
@@ -942,9 +1069,18 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
     isUDP,
   };
 }
-async function remoteSocketToWS(remoteSocket: Deno.TcpConn, webSocket: WebSocket, vlessResponseHeader: Uint8Array, retry: (() => Promise<void>) | null, log: (info: string, event?: string) => void) {
+
+// ─── Remote Socket to WebSocket ──────────────────────────────────────
+async function remoteSocketToWS(
+  remoteSocket: Deno.TcpConn,
+  webSocket: WebSocket,
+  vlessResponseHeader: Uint8Array,
+  retry: (() => Promise<void>) | null,
+  log: (info: string, event?: string) => void
+) {
   let hasIncomingData = false;
   let headerSent = false;
+
   await remoteSocket.readable
     .pipeTo(
       new WritableStream({
@@ -962,7 +1098,7 @@ async function remoteSocketToWS(remoteSocket: Deno.TcpConn, webSocket: WebSocket
           }
         },
         close() {
-          log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
+          log(`remoteConnection!.readable is closed with hasIncomingData is ${hasIncomingData}`);
         },
         abort(reason) {
           console.error(`remoteConnection!.readable abort`, reason);
@@ -973,11 +1109,14 @@ async function remoteSocketToWS(remoteSocket: Deno.TcpConn, webSocket: WebSocket
       console.error(`remoteSocketToWS has exception `, error.stack || error);
       safeCloseWebSocket(webSocket);
     });
+
   if (hasIncomingData === false && retry) {
     log(`retry`);
-    retry();
+    await retry();
   }
 }
+
+// ─── Base64 Decoder ──────────────────────────────────────────────────
 function base64ToArrayBuffer(base64Str: string) {
   if (!base64Str) {
     return { error: null };
@@ -991,12 +1130,11 @@ function base64ToArrayBuffer(base64Str: string) {
     return { error: error };
   }
 }
-function isValidUUID(uuid: string): boolean {
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  return uuidRegex.test(uuid);
-}
+
+// ─── WebSocket Helpers ───────────────────────────────────────────────
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
+
 function safeCloseWebSocket(socket: WebSocket) {
   try {
     if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
@@ -1006,10 +1144,13 @@ function safeCloseWebSocket(socket: WebSocket) {
     console.error('safeCloseWebSocket error', error);
   }
 }
+
+// ─── UUID Byte-to-Hex ────────────────────────────────────────────────
 const byteToHex: string[] = [];
 for (let i = 0; i < 256; ++i) {
   byteToHex.push((i + 256).toString(16).slice(1));
 }
+
 function unsafeStringify(arr: Uint8Array, offset = 0) {
   return (
     byteToHex[arr[offset + 0]] +
@@ -1034,6 +1175,7 @@ function unsafeStringify(arr: Uint8Array, offset = 0) {
     byteToHex[arr[offset + 15]]
   ).toLowerCase();
 }
+
 function stringify(arr: Uint8Array, offset = 0) {
   const uuid = unsafeStringify(arr, offset);
   if (!isValidUUID(uuid)) {
@@ -1041,30 +1183,44 @@ function stringify(arr: Uint8Array, offset = 0) {
   }
   return uuid;
 }
-async function handleUDPOutBound(webSocket: WebSocket, vlessResponseHeader: Uint8Array, log: (info: string) => void) {
+
+// ─── UDP Outbound (DNS only) ─────────────────────────────────────────
+async function handleUDPOutBound(
+  webSocket: WebSocket,
+  vlessResponseHeader: Uint8Array,
+  log: (info: string) => void
+) {
   let isVlessHeaderSent = false;
+
   const transformStream = new TransformStream({
     start(_controller) {},
     transform(chunk, controller) {
       for (let index = 0; index < chunk.byteLength;) {
+        if (index + 2 > chunk.byteLength) {
+          console.error('UDP: not enough data for length header');
+          break;
+        }
         const lengthBuffer = chunk.slice(index, index + 2);
-        const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
-        const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPakcetLength));
-        index = index + 2 + udpPakcetLength;
+        const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
+        if (udpPacketLength === 0 || index + 2 + udpPacketLength > chunk.byteLength) {
+          console.error('UDP: invalid packet length or exceeds buffer');
+          break;
+        }
+        const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength));
+        index = index + 2 + udpPacketLength;
         controller.enqueue(udpData);
       }
     },
     flush(_controller) {},
   });
+
   transformStream.readable
     .pipeTo(
       new WritableStream({
         async write(chunk) {
           const resp = await fetch('https://1.1.1.1/dns-query', {
             method: 'POST',
-            headers: {
-              'content-type': 'application/dns-message',
-            },
+            headers: { 'content-type': 'application/dns-message' },
             body: chunk,
           });
           const dnsQueryResult = await resp.arrayBuffer();
@@ -1083,8 +1239,9 @@ async function handleUDPOutBound(webSocket: WebSocket, vlessResponseHeader: Uint
       })
     )
     .catch((error) => {
-      log('dns udp has error' + error);
+      log('dns udp has error: ' + error);
     });
+
   const writer = transformStream.writable.getWriter();
   return {
     write(chunk: Uint8Array) {
