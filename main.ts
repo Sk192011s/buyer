@@ -273,6 +273,142 @@ const getHtml = (title: string, bodyContent: string) => `
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
         }
+        .countdown {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin: 30px 0;
+        }
+        .countdown-item {
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 20px 24px;
+            min-width: 80px;
+        }
+        .countdown-number {
+            font-size: 2.2rem;
+            font-weight: 800;
+            background: linear-gradient(to bottom, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            line-height: 1;
+        }
+        .countdown-label {
+            font-size: 0.75rem;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-top: 8px;
+        }
+        .progress-bar {
+            background: rgba(15, 23, 42, 0.6);
+            border-radius: 10px;
+            height: 6px;
+            margin: 30px 0;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            border-radius: 10px;
+            background: linear-gradient(to right, #3b82f6, #a78bfa);
+            animation: progressAnim 3s ease-in-out infinite;
+            width: 65%;
+        }
+        @keyframes progressAnim {
+            0% { width: 55%; }
+            50% { width: 75%; }
+            100% { width: 55%; }
+        }
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin: 30px 0;
+        }
+        .feature-item {
+            background: rgba(15, 23, 42, 0.4);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px 12px;
+        }
+        .feature-icon {
+            font-size: 1.8rem;
+            margin-bottom: 8px;
+        }
+        .feature-name {
+            font-size: 0.85rem;
+            color: #94a3b8;
+            font-weight: 500;
+        }
+        .email-form {
+            display: flex;
+            gap: 10px;
+            max-width: 420px;
+            margin: 0 auto;
+        }
+        .email-input {
+            flex: 1;
+            padding: 12px 18px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: rgba(15, 23, 42, 0.6);
+            color: var(--text-main);
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .email-input:focus {
+            border-color: var(--primary);
+        }
+        .email-input::placeholder {
+            color: #475569;
+        }
+        .notify-btn {
+            padding: 12px 24px;
+            border-radius: 12px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.95rem;
+            white-space: nowrap;
+        }
+        .notify-btn:hover {
+            background: var(--primary-hover);
+            transform: translateY(-1px);
+        }
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%) translateY(100px);
+            background: rgba(30, 41, 59, 0.95);
+            border: 1px solid rgba(74, 222, 128, 0.2);
+            color: #4ade80;
+            padding: 14px 28px;
+            border-radius: 12px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: transform 0.4s ease;
+            backdrop-filter: blur(8px);
+            z-index: 100;
+        }
+        .toast.show {
+            transform: translateX(-50%) translateY(0);
+        }
+        @media (max-width: 600px) {
+            .container { padding: 28px 20px; }
+            h1 { font-size: 1.8rem; }
+            .countdown { gap: 10px; }
+            .countdown-item { padding: 14px 16px; min-width: 60px; }
+            .countdown-number { font-size: 1.6rem; }
+            .feature-grid { grid-template-columns: repeat(3, 1fr); gap: 10px; }
+            .feature-item { padding: 14px 8px; }
+            .email-form { flex-direction: column; }
+        }
     </style>
 </head>
 <body>
@@ -386,9 +522,95 @@ Deno.serve(async (request: Request) => {
   switch (url.pathname) {
     case '/': {
       const content = `
-          <h1>Hello</h1>
+          <h1>NovaByte Cloud</h1>
+          <p>We're crafting a next-generation cloud platform.<br>Something amazing is on the way.</p>
+          
+          <div class="countdown" id="countdown">
+              <div class="countdown-item">
+                  <div class="countdown-number" id="days">00</div>
+                  <div class="countdown-label">Days</div>
+              </div>
+              <div class="countdown-item">
+                  <div class="countdown-number" id="hours">00</div>
+                  <div class="countdown-label">Hours</div>
+              </div>
+              <div class="countdown-item">
+                  <div class="countdown-number" id="minutes">00</div>
+                  <div class="countdown-label">Minutes</div>
+              </div>
+              <div class="countdown-item">
+                  <div class="countdown-number" id="seconds">00</div>
+                  <div class="countdown-label">Seconds</div>
+              </div>
+          </div>
+
+          <div class="progress-bar">
+              <div class="progress-fill"></div>
+          </div>
+
+          <div class="feature-grid">
+              <div class="feature-item">
+                  <div class="feature-icon">⚡</div>
+                  <div class="feature-name">Lightning Fast</div>
+              </div>
+              <div class="feature-item">
+                  <div class="feature-icon">🔒</div>
+                  <div class="feature-name">Secure</div>
+              </div>
+              <div class="feature-item">
+                  <div class="feature-icon">🌍</div>
+                  <div class="feature-name">Global CDN</div>
+              </div>
+          </div>
+
+          <p style="margin-bottom: 1rem; font-size: 0.95rem;">Get notified when we launch</p>
+          <div class="email-form">
+              <input type="email" class="email-input" id="emailInput" placeholder="Enter your email">
+              <button class="notify-btn" onclick="handleNotify()">Notify Me</button>
+          </div>
+
+          <div class="footer">
+              <p>&copy; 2026 NovaByte Cloud Inc. All rights reserved.</p>
+          </div>
+
+          <div class="toast" id="toast">Thanks! We'll notify you at launch.</div>
+
+          <script>
+              // Countdown - always 90 days from now
+              const launchDate = new Date();
+              launchDate.setDate(launchDate.getDate() + 90);
+              
+              function updateCountdown() {
+                  const now = new Date();
+                  const diff = launchDate - now;
+                  const d = Math.floor(diff / (1000 * 60 * 60 * 24));
+                  const h = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                  const m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+                  const s = Math.floor((diff % (1000 * 60)) / 1000);
+                  document.getElementById('days').textContent = String(d).padStart(2, '0');
+                  document.getElementById('hours').textContent = String(h).padStart(2, '0');
+                  document.getElementById('minutes').textContent = String(m).padStart(2, '0');
+                  document.getElementById('seconds').textContent = String(s).padStart(2, '0');
+              }
+              updateCountdown();
+              setInterval(updateCountdown, 1000);
+
+              function handleNotify() {
+                  const email = document.getElementById('emailInput').value;
+                  if (email && email.includes('@')) {
+                      const toast = document.getElementById('toast');
+                      toast.classList.add('show');
+                      document.getElementById('emailInput').value = '';
+                      setTimeout(() => toast.classList.remove('show'), 3000);
+                  }
+              }
+
+              document.getElementById('emailInput').addEventListener('keypress', function(e) {
+                  if (e.key === 'Enter') handleNotify();
+              });
+          </script>
       `;
-      return new Response(getHtml('Hello', content), {
+      return new Response(getHtml('NovaByte Cloud - Coming Soon', content), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
