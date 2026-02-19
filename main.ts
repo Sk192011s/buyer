@@ -30,7 +30,6 @@ function constantTimeEqual(a: string, b: string): boolean {
   const bufA = encoder.encode(a);
   const bufB = encoder.encode(b);
   if (bufA.length !== bufB.length) {
-    // still iterate to avoid timing leak on length
     let dummy = 0;
     for (let i = 0; i < bufA.length; i++) {
       dummy |= bufA[i] ^ (bufB[i % bufB.length] || 0);
@@ -525,6 +524,22 @@ async function connectWithTimeout(hostname: string, port: number, timeout: numbe
   }
 }
 
+// ─── Helper: Check if error is a normal disconnect ───────────────────
+function isNormalDisconnectError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const err = error as Error & { code?: string; name?: string };
+    return (
+      err.code === 'EINTR' ||
+      err.name === 'Interrupted' ||
+      err.name === 'AbortError' ||
+      err.message?.includes('operation canceled') ||
+      err.message?.includes('connection reset') ||
+      err.message?.includes('broken pipe')
+    );
+  }
+  return false;
+}
+
 // ─── Main Server ─────────────────────────────────────────────────────
 Deno.serve(async (request: Request) => {
   const upgrade = request.headers.get('upgrade') || '';
@@ -744,6 +759,22 @@ async function vlessOverWSHandler(request: Request) {
   let udpStreamWrite: ((chunk: Uint8Array) => void) | null = null;
   let isDns = false;
 
+  // ── WebSocket ပိတ်ရင် remote TCP ကိုလည်း ပိတ်ပေးမယ် ──
+  const cleanupRemote = () => {
+    safeCloseRemote(remoteSocketWrapper.value);
+    remoteSocketWrapper.value = null;
+  };
+
+  socket.addEventListener('close', () => {
+    log('WebSocket closed by client');
+    cleanupRemote();
+  });
+
+  socket.addEventListener('error', (e) => {
+    log('WebSocket error', String(e));
+    cleanupRemote();
+  });
+
   readableWebSocketStream
     .pipeTo(
       new WritableStream({
@@ -809,17 +840,21 @@ async function vlessOverWSHandler(request: Request) {
         },
         close() {
           log(`readableWebSocketStream is closed`);
-          safeCloseRemote(remoteSocketWrapper.value);
+          cleanupRemote();
         },
         abort(reason) {
           log(`readableWebSocketStream is aborted`, JSON.stringify(reason));
-          safeCloseRemote(remoteSocketWrapper.value);
+          cleanupRemote();
         },
       })
     )
     .catch((err) => {
-      log('readableWebSocketStream pipeTo error', err);
-      safeCloseRemote(remoteSocketWrapper.value);
+      if (isNormalDisconnectError(err)) {
+        log('WebSocket stream ended (client disconnected)');
+      } else {
+        log('readableWebSocketStream pipeTo error', String(err));
+      }
+      cleanupRemote();
       safeCloseWebSocket(socket);
     });
 
@@ -910,18 +945,21 @@ function makeReadableWebSocketStream(
             log('Blob to ArrayBuffer error', String(err));
           });
         }
-        // string type is not valid for VLESS binary protocol, ignore
       });
 
       webSocketServer.addEventListener('close', () => {
         safeCloseWebSocket(webSocketServer);
         if (readableStreamCancel) return;
-        controller.close();
+        try {
+          controller.close();
+        } catch (_) { /* stream may already be closed */ }
       });
 
       webSocketServer.addEventListener('error', (err) => {
         log('webSocketServer has error');
-        controller.error(err);
+        try {
+          controller.error(err);
+        } catch (_) { /* stream may already be errored */ }
       });
 
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
@@ -951,13 +989,11 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
   const version = new Uint8Array(vlessBuffer.slice(0, 1));
   const incomingUUID = stringify(new Uint8Array(vlessBuffer.slice(1, 17))).toLowerCase();
 
-  // Constant-time UUID validation
   let isValidUser = false;
   for (const id of validUserIDs) {
     if (constantTimeEqual(id, incomingUUID)) {
       isValidUser = true;
     }
-    // intentionally no break — constant-time
   }
 
   if (!isValidUser) {
@@ -966,7 +1002,6 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
   const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
 
-  // Bounds check for optLength
   if (18 + optLength + 1 > vlessBuffer.byteLength) {
     return { hasError: true, message: 'invalid header: optLength exceeds buffer' };
   }
@@ -987,7 +1022,6 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
   const portIndex = 18 + optLength + 1;
 
-  // Bounds check for port
   if (portIndex + 2 > vlessBuffer.byteLength) {
     return { hasError: true, message: 'invalid header: buffer too short for port' };
   }
@@ -997,7 +1031,6 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
   const addressIndex = portIndex + 2;
 
-  // Bounds check for address type
   if (addressIndex + 1 > vlessBuffer.byteLength) {
     return { hasError: true, message: 'invalid header: buffer too short for address type' };
   }
@@ -1010,7 +1043,6 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
   switch (addressType) {
     case 1: {
-      // IPv4
       addressLength = 4;
       if (addressValueIndex + addressLength > vlessBuffer.byteLength) {
         return { hasError: true, message: 'invalid header: buffer too short for IPv4 address' };
@@ -1019,7 +1051,6 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
       break;
     }
     case 2: {
-      // Domain
       if (addressValueIndex + 1 > vlessBuffer.byteLength) {
         return { hasError: true, message: 'invalid header: buffer too short for domain length' };
       }
@@ -1032,7 +1063,6 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
       break;
     }
     case 3: {
-      // IPv6
       addressLength = 16;
       if (addressValueIndex + addressLength > vlessBuffer.byteLength) {
         return { hasError: true, message: 'invalid header: buffer too short for IPv6 address' };
@@ -1070,7 +1100,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
   };
 }
 
-// ─── Remote Socket to WebSocket ──────────────────────────────────────
+// ─── Remote Socket to WebSocket (FIXED) ─────────────────────────────
 async function remoteSocketToWS(
   remoteSocket: Deno.TcpConn,
   webSocket: WebSocket,
@@ -1081,34 +1111,69 @@ async function remoteSocketToWS(
   let hasIncomingData = false;
   let headerSent = false;
 
-  await remoteSocket.readable
-    .pipeTo(
-      new WritableStream({
-        start() {},
-        async write(chunk, controller) {
-          hasIncomingData = true;
-          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-            controller.error('webSocket.readyState is not open, maybe close');
-          }
-          if (!headerSent) {
-            webSocket.send(new Uint8Array([...vlessResponseHeader, ...chunk]));
-            headerSent = true;
-          } else {
-            webSocket.send(chunk);
-          }
-        },
-        close() {
-          log(`remoteConnection!.readable is closed with hasIncomingData is ${hasIncomingData}`);
-        },
-        abort(reason) {
-          console.error(`remoteConnection!.readable abort`, reason);
-        },
-      })
-    )
-    .catch((error) => {
-      console.error(`remoteSocketToWS has exception `, error.stack || error);
-      safeCloseWebSocket(webSocket);
-    });
+  // WebSocket ပိတ်ရင် TCP read ကို ရပ်ဖို့ AbortController သုံးမယ်
+  const abortController = new AbortController();
+
+  const onWsClose = () => {
+    abortController.abort();
+  };
+
+  webSocket.addEventListener('close', onWsClose);
+  webSocket.addEventListener('error', onWsClose);
+
+  try {
+    await remoteSocket.readable
+      .pipeTo(
+        new WritableStream({
+          start() {},
+          async write(chunk, controller) {
+            hasIncomingData = true;
+
+            // WebSocket ပိတ်သွားရင် stream ကို ရပ်ပါ
+            if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+              controller.error('webSocket is closed');
+              return;
+            }
+
+            try {
+              if (!headerSent) {
+                webSocket.send(new Uint8Array([...vlessResponseHeader, ...chunk]));
+                headerSent = true;
+              } else {
+                webSocket.send(chunk);
+              }
+            } catch (e) {
+              controller.error('WebSocket send failed: ' + (e as Error).message);
+            }
+          },
+          close() {
+            log(`remoteConnection!.readable is closed with hasIncomingData is ${hasIncomingData}`);
+          },
+          abort(reason) {
+            if (isNormalDisconnectError(reason)) {
+              log('Remote read ended (client disconnected)');
+            } else {
+              console.error('remoteConnection!.readable abort', reason);
+            }
+          },
+        }),
+        { signal: abortController.signal }
+      );
+  } catch (error) {
+    if (isNormalDisconnectError(error)) {
+      log('Connection ended normally (client disconnected)');
+    } else {
+      console.error('remoteSocketToWS has exception', (error as Error).stack || error);
+    }
+    safeCloseRemote(remoteSocket);
+    safeCloseWebSocket(webSocket);
+  } finally {
+    // Event listener တွေ cleanup လုပ်ပါ
+    try {
+      webSocket.removeEventListener('close', onWsClose);
+      webSocket.removeEventListener('error', onWsClose);
+    } catch (_) { /* ignore */ }
+  }
 
   if (hasIncomingData === false && retry) {
     log(`retry`);
