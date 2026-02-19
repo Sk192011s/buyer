@@ -10,13 +10,6 @@ const webUsername = Deno.env.get('WEB_USERNAME') || '';
 const stickyProxyIPEnv = Deno.env.get('STICKY_PROXYIP') || '';
 const CONFIG_FILE = 'config.json';
 
-// ─── Tunable Constants ───────────────────────────────────────────────
-const CONNECTION_TIMEOUT = 10000;
-const WS_PING_INTERVAL = 30000;
-const MAX_TRACKED_IPS = 10000;
-const RATE_LIMIT_WINDOW = 15 * 60 * 1000;
-const RATE_LIMIT_MAX_ATTEMPTS = 5;
-
 interface Config {
   uuid?: string;
 }
@@ -37,6 +30,7 @@ function constantTimeEqual(a: string, b: string): boolean {
   const bufA = encoder.encode(a);
   const bufB = encoder.encode(b);
   if (bufA.length !== bufB.length) {
+    // still iterate to avoid timing leak on length
     let dummy = 0;
     for (let i = 0; i < bufA.length; i++) {
       dummy |= bufA[i] ^ (bufB[i % bufB.length] || 0);
@@ -51,6 +45,9 @@ function constantTimeEqual(a: string, b: string): boolean {
 }
 
 // ─── Rate Limiter ────────────────────────────────────────────────────
+const MAX_TRACKED_IPS = 10000;
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000;
+const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const loginAttempts = new Map<string, { count: number; lastAttempt: number }>();
 
 setInterval(() => {
@@ -210,6 +207,7 @@ console.log(`Fixed Proxy IP: ${fixedProxyIP || '(none — direct connection)'}`)
 
 // ─── Connection Tracking & Graceful Shutdown ─────────────────────────
 const activeConnections = new Set<Deno.TcpConn>();
+const CONNECTION_TIMEOUT = 10000;
 
 function trackConnection(conn: Deno.TcpConn): void {
   activeConnections.add(conn);
@@ -527,19 +525,6 @@ async function connectWithTimeout(hostname: string, port: number, timeout: numbe
   }
 }
 
-// ─── Helper: is a "normal" connection-reset error ────────────────────
-function isConnectionReset(e: unknown): boolean {
-  if (e instanceof Error) {
-    const name = (e as any).name || '';
-    const code = (e as any).code || '';
-    return name === 'ConnectionReset'
-      || code === 'ECONNRESET'
-      || name === 'BrokenPipe'
-      || code === 'EPIPE';
-  }
-  return false;
-}
-
 // ─── Main Server ─────────────────────────────────────────────────────
 Deno.serve(async (request: Request) => {
   const upgrade = request.headers.get('upgrade') || '';
@@ -750,33 +735,6 @@ async function vlessOverWSHandler(request: Request) {
     console.log(`[${address}:${portWithRandomLog}] ${info}`, event);
   };
 
-  // ── WebSocket keep-alive ping ──────────────────────────────────────
-  let pingInterval: number | undefined;
-
-  socket.addEventListener('open', () => {
-    pingInterval = setInterval(() => {
-      if (socket.readyState === WS_READY_STATE_OPEN) {
-        try {
-          socket.send(new Uint8Array(0));
-        } catch (_) {
-          clearInterval(pingInterval);
-        }
-      } else {
-        clearInterval(pingInterval);
-      }
-    }, WS_PING_INTERVAL);
-  });
-
-  const clearPing = () => {
-    if (pingInterval !== undefined) {
-      clearInterval(pingInterval);
-      pingInterval = undefined;
-    }
-  };
-
-  socket.addEventListener('close', clearPing);
-  socket.addEventListener('error', clearPing);
-
   const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
   const readableWebSocketStream = makeReadableWebSocketStream(socket, earlyDataHeader, log);
 
@@ -794,22 +752,11 @@ async function vlessOverWSHandler(request: Request) {
             return udpStreamWrite(chunk);
           }
           if (remoteSocketWrapper.value) {
+            const writer = remoteSocketWrapper.value.writable.getWriter();
             try {
-              const writer = remoteSocketWrapper.value.writable.getWriter();
-              try {
-                await writer.write(new Uint8Array(chunk));
-              } finally {
-                writer.releaseLock();
-              }
-            } catch (e) {
-              if (isConnectionReset(e)) {
-                log(`Write to remote failed (connection reset), closing`);
-                safeCloseRemote(remoteSocketWrapper.value);
-                remoteSocketWrapper.value = null;
-                controller.error(e);
-              } else {
-                throw e;
-              }
+              await writer.write(new Uint8Array(chunk));
+            } finally {
+              writer.releaseLock();
             }
             return;
           }
@@ -843,14 +790,14 @@ async function vlessOverWSHandler(request: Request) {
           const rawClientData = chunk.slice(rawDataIndex);
 
           if (isDns) {
-            log('isDns: true');
+            console.log('isDns:', isDns);
             const { write } = await handleUDPOutBound(socket, vlessResponseHeader, log);
             udpStreamWrite = write;
             udpStreamWrite(rawClientData);
             return;
           }
 
-          await handleTCPOutBound(
+          handleTCPOutBound(
             remoteSocketWrapper,
             addressRemote,
             portRemote,
@@ -863,24 +810,17 @@ async function vlessOverWSHandler(request: Request) {
         close() {
           log(`readableWebSocketStream is closed`);
           safeCloseRemote(remoteSocketWrapper.value);
-          clearPing();
         },
         abort(reason) {
           log(`readableWebSocketStream is aborted`, JSON.stringify(reason));
           safeCloseRemote(remoteSocketWrapper.value);
-          clearPing();
         },
       })
     )
     .catch((err) => {
-      if (isConnectionReset(err)) {
-        log('Client WebSocket stream ended (connection reset)');
-      } else {
-        log('readableWebSocketStream pipeTo error', String(err));
-      }
+      log('readableWebSocketStream pipeTo error', err);
       safeCloseRemote(remoteSocketWrapper.value);
       safeCloseWebSocket(socket);
-      clearPing();
     });
 
   return response;
@@ -907,12 +847,6 @@ async function handleTCPOutBound(
   async function connectAndWrite(address: string, port: number) {
     try {
       const tcpSocket = await connectWithTimeout(address, port, CONNECTION_TIMEOUT);
-
-      // Clean up any previous connection before assigning
-      if (remoteSocket.value) {
-        safeCloseRemote(remoteSocket.value);
-      }
-
       remoteSocket.value = tcpSocket;
       trackConnection(tcpSocket);
       log(`connected to ${address}:${port}`);
@@ -930,10 +864,6 @@ async function handleTCPOutBound(
   }
 
   async function retry() {
-    // Clean up the failed connection before retry
-    safeCloseRemote(remoteSocket.value);
-    remoteSocket.value = null;
-
     try {
       const fallbackIP = getFixedProxyIP();
       if (!fallbackIP) {
@@ -943,7 +873,7 @@ async function handleTCPOutBound(
       }
       log(`Retrying with fixed proxy IP: ${fallbackIP}`);
       const tcpSocket = await connectAndWrite(fallbackIP, portRemote);
-      await remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+      remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
     } catch (e) {
       log(`Retry failed: ${(e as Error).message}`);
       safeCloseWebSocket(webSocket);
@@ -952,7 +882,7 @@ async function handleTCPOutBound(
 
   try {
     const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-    await remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
   } catch (e) {
     log(`Initial connection failed: ${(e as Error).message}, attempting retry...`);
     await retry();
@@ -972,14 +902,10 @@ function makeReadableWebSocketStream(
         if (readableStreamCancel) return;
         const data = event.data;
         if (data instanceof ArrayBuffer) {
-          // Skip empty pings (keep-alive packets)
-          if (data.byteLength === 0) return;
           controller.enqueue(data);
         } else if (data instanceof Blob) {
           data.arrayBuffer().then(buf => {
-            if (!readableStreamCancel && buf.byteLength > 0) {
-              controller.enqueue(buf);
-            }
+            if (!readableStreamCancel) controller.enqueue(buf);
           }).catch(err => {
             log('Blob to ArrayBuffer error', String(err));
           });
@@ -1040,6 +966,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
   const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
 
+  // Bounds check for optLength
   if (18 + optLength + 1 > vlessBuffer.byteLength) {
     return { hasError: true, message: 'invalid header: optLength exceeds buffer' };
   }
@@ -1060,6 +987,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
   const portIndex = 18 + optLength + 1;
 
+  // Bounds check for port
   if (portIndex + 2 > vlessBuffer.byteLength) {
     return { hasError: true, message: 'invalid header: buffer too short for port' };
   }
@@ -1069,6 +997,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
   const addressIndex = portIndex + 2;
 
+  // Bounds check for address type
   if (addressIndex + 1 > vlessBuffer.byteLength) {
     return { hasError: true, message: 'invalid header: buffer too short for address type' };
   }
@@ -1081,6 +1010,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
 
   switch (addressType) {
     case 1: {
+      // IPv4
       addressLength = 4;
       if (addressValueIndex + addressLength > vlessBuffer.byteLength) {
         return { hasError: true, message: 'invalid header: buffer too short for IPv4 address' };
@@ -1089,6 +1019,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
       break;
     }
     case 2: {
+      // Domain
       if (addressValueIndex + 1 > vlessBuffer.byteLength) {
         return { hasError: true, message: 'invalid header: buffer too short for domain length' };
       }
@@ -1101,6 +1032,7 @@ function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
       break;
     }
     case 3: {
+      // IPv6
       addressLength = 16;
       if (addressValueIndex + addressLength > vlessBuffer.byteLength) {
         return { hasError: true, message: 'invalid header: buffer too short for IPv6 address' };
@@ -1149,51 +1081,37 @@ async function remoteSocketToWS(
   let hasIncomingData = false;
   let headerSent = false;
 
-  try {
-    await remoteSocket.readable
-      .pipeTo(
-        new WritableStream({
-          start() {},
-          write(chunk, controller) {
-            hasIncomingData = true;
+  await remoteSocket.readable
+    .pipeTo(
+      new WritableStream({
+        start() {},
+        async write(chunk, controller) {
+          hasIncomingData = true;
+          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            controller.error('webSocket.readyState is not open, maybe close');
+          }
+          if (!headerSent) {
+            webSocket.send(new Uint8Array([...vlessResponseHeader, ...chunk]));
+            headerSent = true;
+          } else {
+            webSocket.send(chunk);
+          }
+        },
+        close() {
+          log(`remoteConnection!.readable is closed with hasIncomingData is ${hasIncomingData}`);
+        },
+        abort(reason) {
+          console.error(`remoteConnection!.readable abort`, reason);
+        },
+      })
+    )
+    .catch((error) => {
+      console.error(`remoteSocketToWS has exception `, error.stack || error);
+      safeCloseWebSocket(webSocket);
+    });
 
-            if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-              controller.error('webSocket is not open');
-              return;
-            }
-
-            try {
-              if (!headerSent) {
-                webSocket.send(new Uint8Array([...vlessResponseHeader, ...chunk]));
-                headerSent = true;
-              } else {
-                webSocket.send(chunk);
-              }
-            } catch (e) {
-              controller.error(`WebSocket send failed: ${(e as Error).message}`);
-            }
-          },
-          close() {
-            log(`remote readable closed, hasIncomingData: ${hasIncomingData}`);
-          },
-          abort(reason) {
-            // Downgraded from console.error — connection resets are normal
-            log(`remote readable aborted: ${reason}`);
-          },
-        })
-      );
-  } catch (error) {
-    if (isConnectionReset(error)) {
-      log(`Remote connection reset (normal for short-lived connections)`);
-    } else {
-      log(`remoteSocketToWS error: ${(error as Error).message}`);
-    }
-    safeCloseWebSocket(webSocket);
-  }
-
-  // If we never got data from the remote, try fallback proxy
-  if (!hasIncomingData && retry) {
-    log(`No data received from remote, retrying...`);
+  if (hasIncomingData === false && retry) {
+    log(`retry`);
     await retry();
   }
 }
@@ -1300,26 +1218,22 @@ async function handleUDPOutBound(
     .pipeTo(
       new WritableStream({
         async write(chunk) {
-          try {
-            const resp = await fetch('https://1.1.1.1/dns-query', {
-              method: 'POST',
-              headers: { 'content-type': 'application/dns-message' },
-              body: chunk,
-            });
-            const dnsQueryResult = await resp.arrayBuffer();
-            const udpSize = dnsQueryResult.byteLength;
-            const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
-            if (webSocket.readyState === WS_READY_STATE_OPEN) {
-              log(`doh success and dns message length is ${udpSize}`);
-              if (isVlessHeaderSent) {
-                webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-              } else {
-                webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-                isVlessHeaderSent = true;
-              }
+          const resp = await fetch('https://1.1.1.1/dns-query', {
+            method: 'POST',
+            headers: { 'content-type': 'application/dns-message' },
+            body: chunk,
+          });
+          const dnsQueryResult = await resp.arrayBuffer();
+          const udpSize = dnsQueryResult.byteLength;
+          const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+          if (webSocket.readyState === WS_READY_STATE_OPEN) {
+            log(`doh success and dns message length is ${udpSize}`);
+            if (isVlessHeaderSent) {
+              webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+            } else {
+              webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+              isVlessHeaderSent = true;
             }
-          } catch (e) {
-            log(`DNS query failed: ${(e as Error).message}`);
           }
         },
       })
