@@ -1,4 +1,4 @@
-import { exists } from "@std/fs/exists"; // Import exists function
+import { exists } from "jsr:@std/fs/exists"; // Import exists function
 
 const envUUID = Deno.env.get('UUID') || '';
 const proxyIP = Deno.env.get('PROXYIP') || '';
