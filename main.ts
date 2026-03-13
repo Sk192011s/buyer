@@ -1,4 +1,4 @@
-import { exists } from "https://deno.land/std/fs/exists.ts"; // Import exists function
+import { exists } from "@std/fs/exists"; // Import exists function
 
 const envUUID = Deno.env.get('UUID') || '';
 const proxyIP = Deno.env.get('PROXYIP') || '';
